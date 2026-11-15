@@ -10,6 +10,7 @@ use tokio::{
 use super::{
     PlayerState, PlayerTrack,
     ipc::{Endpoint, Stream},
+    native_controls::{NativeControl, NativeInput},
 };
 
 pub struct Mpv {
@@ -19,6 +20,7 @@ pub struct Mpv {
     writer: WriteHalf<Stream>,
     request_id: u64,
     indexed_loadfile: bool,
+    native_input: NativeInput,
 }
 
 impl Mpv {
@@ -94,6 +96,7 @@ impl Mpv {
             writer,
             request_id: 0,
             indexed_loadfile: false,
+            native_input: NativeInput::default(),
         };
         // Transfer credentials over IPC, never command-line arguments or media URLs.
         mpv.set(
@@ -128,6 +131,9 @@ impl Mpv {
                     .await?
                     .context("mpv closed its IPC connection")?;
                 let message: Value = serde_json::from_str(&line)?;
+                if message["event"] == "seek" {
+                    self.native_input.seek_event();
+                }
                 if message["request_id"].as_u64() == Some(id) {
                     return Ok(message);
                 }
@@ -146,6 +152,11 @@ impl Mpv {
     }
 
     pub async fn set(&mut self, property: &str, value: Value) -> Result<()> {
+        if property == "pause"
+            && let Some(paused) = value.as_bool()
+        {
+            self.native_input.managed_pause(paused);
+        }
         self.command(json!(["set_property", property, value])).await
     }
 
@@ -155,6 +166,7 @@ impl Mpv {
     }
 
     pub async fn load(&mut self, url: &str, position: f64) -> Result<()> {
+        self.native_input.loading();
         let options = json!({"start": position.to_string(), "pause": "yes"});
         if self.indexed_loadfile {
             self.command(json!(["loadfile", url, "replace", -1, options]))
@@ -163,6 +175,41 @@ impl Mpv {
             self.command(json!(["loadfile", url, "replace", options]))
                 .await
         }
+    }
+
+    /// Every synchronization seek goes through this wrapper. Raw player/OSC/key commands
+    /// do not, allowing their seek events to be forwarded rather than corrected away.
+    pub async fn seek(&mut self, position: f64) -> Result<()> {
+        self.native_input.managed_seek(position);
+        self.command(json!(["seek", position, "absolute+exact"]))
+            .await
+    }
+
+    pub fn arm_native_input(&mut self) {
+        self.native_input.arm();
+    }
+
+    pub async fn native_control(&mut self, player: &PlayerState) -> Result<NativeControl> {
+        let mut position = player.position;
+        let mut seeking = player.seeking;
+        if self.native_input.seek_pending() && !seeking {
+            // An event can arrive during a later sample property request. Read the landing
+            // position again, bracketed by seeking checks, rather than publishing a pre-seek sample.
+            seeking = self
+                .get("seeking")
+                .await?
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if !seeking {
+                position = self.get("time-pos").await?.and_then(|v| v.as_f64());
+                seeking = self
+                    .get("seeking")
+                    .await?
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+            }
+        }
+        Ok(self.native_input.observe(position, player.paused, seeking))
     }
 
     pub async fn sample(&mut self) -> Result<PlayerState> {

@@ -64,7 +64,7 @@ The release client does not open an extra console window. Video still opens in a
 .\target\release\watchmpv-client.exe
 ```
 
-Enter the server address, display name, and password in the companion window. All connected participants can use its **Play/Pause** and **Seek** controls. Commands are ordered by the server and affect everyone. Audio, subtitles, and quality stay per-viewer. Only the host can cancel/retry shared transcoding jobs.
+Enter the server address, display name, and password in the companion window. All connected participants can use **Play/Pause** and **Seek** in either the companion window or mpv itself (Space, seek keys, and the on-screen timeline). Update the client to v0.3.1 or newer for native-player controls; a v0.3.0 server is compatible. Commands are ordered by the server and affect everyone. Audio, subtitles, and quality stay per-viewer. Only the host can cancel/retry shared transcoding jobs.
 
 ## Host on Windows
 
@@ -104,4 +104,4 @@ cargo test --locked --all-features
 cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
-Tests use null mpv audio/video outputs, so they do not open playback windows. Windows-specific tests exercise real named-pipe transport; the two-mpv integration test covers guest play/pause/seeking, host measurement updates, quality retry, language selection, and handoff. Native Windows execution is delegated to Windows CI; a successful cross-compilation alone is not a runtime validation.
+Tests use null mpv audio/video outputs, so they do not open playback windows. Windows-specific tests exercise real named-pipe transport; the two-mpv integration tests cover guest play/pause/seeking through both companion controls and real mpv keypress/seek commands, sync-feedback suppression, host measurement updates, quality retry, language selection, and handoff. Native Windows execution is delegated to Windows CI; a successful cross-compilation alone is not a runtime validation.

@@ -13,7 +13,7 @@ This is an early development build (v0.3), not a production release. The client 
 - Shared, on-demand FFmpeg transcode jobs using CPU (`libx264`) or NVIDIA **NVENC** (`h264_nvenc`), with an opt-in automatic encoder mode.
 - A live transcoding panel showing queued/encoding/cancelling states, progress, speed, and estimated time remaining. The connected host can cancel or retry shared jobs; guests can keep waiting or stay on their current quality.
 - Independent audio/subtitle choices on each viewer. Prepared Matroska renditions retain all source audio/subtitle languages and font attachments. Audio is converted to AAC; subtitles are copied, not burned in. This supports formats such as ASS and PGS when the installed FFmpeg/mpv support them.
-- Shared play/pause/seek controls for every connected participant, late joining, clock-offset estimation, and drift correction. Revision-tagged host measurements cannot overwrite newer shared commands. Small errors use ±3% playback speed; larger errors seek.
+- Shared play/pause/seek controls for every connected participant, from either mpv's keyboard/on-screen player controls or the companion window, plus late joining, clock-offset estimation, and drift correction. Revision-tagged host measurements cannot overwrite newer shared commands. Small errors use ±3% playback speed; larger errors seek.
 - Windows desktop support through mpv named-pipe IPC, alongside Unix sockets on Linux/macOS.
 - Automatic host handoff to the oldest connected guest, with playback paused on handoff.
 - Argon2 password hashes, random 12-hour bearer sessions, bounded login attempts, authenticated media/prepare/WebSocket endpoints, and local mpv IPC (private Unix sockets; see Windows pipe security notes in the Windows guide). Tokens are not passed in URLs or mpv command-line arguments.
@@ -134,11 +134,15 @@ cargo run --features client --bin watchmpv-client
 1. Enter the server's LAN IP/hostname and port (e.g. `192.168.1.20:8787`) or an HTTPS URL (`https://watch.example.com`). A bare hostname without a port defaults to port 8787. Explicit HTTP/HTTPS URLs use their standard ports unless a port is given.
 2. Enter your name and the server password.
 3. The first connected viewer becomes host. Everyone initially joins paused.
-4. **Every connected participant** can use the companion window's play/pause/seek controls to change the shared timeline. The server orders simultaneous commands; the last accepted command wins. Quality, audio, and subtitle choices affect only you. For guests, use the companion controls: local keyboard/OSC changes inside the separate mpv window are still corrected back to the shared timeline.
+4. **Every connected participant** can play, pause, and seek using **either the mpv player itself or the companion window**. Space toggles playback; arrow-key and on-screen timeline seeks are shared too. The server orders simultaneous commands; the last accepted command wins. Synchronization corrections and quality loads are filtered so they do not get broadcast as fresh player input. Quality, volume, audio, and subtitle choices affect only you.
 5. Expand **Server transcoding** to see preparation progress for all qualities. The host can cancel queued/running jobs or retry failed/cancelled jobs. Cancellation affects everyone waiting for that quality, but never stops a completed stream. A retry is limited to once per five seconds per quality; viewers still waiting switch automatically once it succeeds. **Keep current quality** stops your own pending switch without cancelling the shared job.
 6. The password field is cleared after connecting. If the connection drops, re-enter the password to reconnect; playback stops instead of continuing unsynchronized.
 
 The server must be reachable by every client. For LAN use allow TCP port 8787 through the server firewall. For remote use, prefer HTTPS or a trusted VPN rather than exposing unencrypted HTTP.
+
+### Native-player controls fix (v0.3.1)
+
+v0.3.0 shared companion-window controls but still corrected a guest's native mpv input away. **Update/rebuild the clients** for the fix; the v0.3.1 client remains compatible with a v0.3.0 server and uses the same shared-control protocol. No media/cache migration is needed.
 
 ### Upgrading from v0.1/v0.2
 
@@ -167,7 +171,7 @@ cargo test --all-features          # also launches two headless mpv clients
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Tests require FFmpeg/FFprobe; all-feature tests also require mpv 0.35+. They generate disposable multi-audio/multi-subtitle video fixtures. No display or GPU is needed: mpv tests use null video/audio outputs. Tests cover authentication, byte ranges, metadata/language preservation, CPU transcoding, queued/running cancellation and partial-file cleanup, retry cooldowns and host permissions, progress parsing, automatic encoder probing/fallback, duplicate sessions, clock ping/pong, shared guest controls and stale-report rejection, host handoff, and actual synchronized mpv playback/quality switching after a failed preparation and host retry. Hardware NVENC execution must be validated separately on an NVIDIA machine.
+Tests require FFmpeg/FFprobe; all-feature tests also require mpv 0.35+. They generate disposable multi-audio/multi-subtitle video fixtures. No display or GPU is needed: mpv tests use null video/audio outputs. Player-control regression tests issue real mpv keypresses (Space/Right) and raw absolute/relative/percentage seek commands, not just companion-window actions. They also verify that managed drift-correction seeks do not move the room and that native volume/language changes stay local. Tests cover authentication, byte ranges, metadata/language preservation, CPU transcoding, queued/running cancellation and partial-file cleanup, retry cooldowns and host permissions, progress parsing, automatic encoder probing/fallback, duplicate sessions, clock ping/pong, shared guest controls and stale-report rejection, host handoff, and actual synchronized mpv playback/quality switching after a failed preparation and host retry. Hardware NVENC execution must be validated separately on an NVIDIA machine.
 
 ## Structure
 
@@ -184,7 +188,8 @@ src/sync.rs             Drift-correction policy
 src/client/ui.rs       Native egui menus and playback controls
 src/client/mod.rs      Network/player synchronization actor
 src/client/transcoding.rs  Asynchronous inventory/control HTTP requests
-src/client/mpv.rs      mpv process and shared JSON IPC protocol
+src/client/mpv.rs      mpv process, JSON IPC events, and managed seek/pause wrappers
+src/client/native_controls.rs  Native-player input detection and sync-feedback suppression
 src/client/ipc.rs      Unix socket / Windows named-pipe transport
 ```
 

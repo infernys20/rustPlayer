@@ -1,5 +1,6 @@
 mod ipc;
 mod mpv;
+mod native_controls;
 mod transcoding;
 mod ui;
 
@@ -40,6 +41,11 @@ pub enum Action {
     Audio(i64),
     Subtitle(Option<i64>),
     Disconnect,
+    /// Exercise the exact native mpv command path (keyboard/OSC), not companion controls.
+    #[cfg(test)]
+    PlayerCommand(serde_json::Value),
+    #[cfg(test)]
+    ManagedPlayerSeek(f64),
 }
 
 pub enum Event {
@@ -222,6 +228,7 @@ async fn run(
     let mut known_tracks = Vec::new();
     let mut needs_alignment = true;
     let mut pending_load = true;
+    let mut pending_player_control: Option<(u64, Instant)> = None;
     let mut load_started = Instant::now();
     let mut wanted_quality = Quality::Original;
     let mut loading_quality = Quality::Original;
@@ -241,6 +248,10 @@ async fn run(
                 let is_host = snapshot.as_ref().is_some_and(|s| s.leader == Some(login.session_id));
                 match action {
                     Action::Disconnect => break,
+                    #[cfg(test)]
+                    Action::PlayerCommand(command) => { mpv.command(command).await?; }
+                    #[cfg(test)]
+                    Action::ManagedPlayerSeek(position) => { mpv.seek(position).await?; }
                     Action::Pause(paused) if snapshot.is_some() => {
                         socket.send(Message::Text(serde_json::to_string(&ClientMessage::Control { position: None, paused: Some(paused) })?.into())).await?;
                     }
@@ -307,6 +318,9 @@ async fn run(
                             if snapshot.as_ref().is_none_or(|previous| previous.leader != next.leader || previous.control_revision != next.control_revision) {
                                 needs_alignment = true;
                             }
+                            if pending_player_control.is_some_and(|(revision, _)| next.control_revision > revision) {
+                                pending_player_control = None;
+                            }
                             last_snapshot = Instant::now();
                             emit(events, repaint, Event::Room(next.clone()));
                             snapshot = Some(next);
@@ -343,6 +357,27 @@ async fn run(
                     known_tracks = mpv.tracks().await?;
                     last_tracks = Instant::now();
                 }
+                if !pending_load && let Some(state) = &snapshot {
+                    let native = mpv.native_control(&player).await?;
+                    let position = native.position.filter(|p| p.is_finite()).map(|p| p.clamp(0.0, login.media.duration));
+                    if !native.is_empty() && (position.is_some() || native.paused.is_some()) {
+                        socket.send(Message::Text(serde_json::to_string(&ClientMessage::Control { position, paused: native.paused })?.into())).await?;
+                        pending_player_control = Some((state.control_revision, Instant::now()));
+                        needs_alignment = true;
+                    }
+                }
+                if let Some((_, sent)) = pending_player_control {
+                    if sent.elapsed() < Duration::from_secs(2) {
+                        // Keep the player's own input intact while its authoritative echo is in flight.
+                        // In particular, do not snap a guest back or publish a host measurement yet.
+                        player.tracks = known_tracks.clone();
+                        emit(events, repaint, Event::Player(player));
+                        continue;
+                    }
+                    pending_player_control = None;
+                    needs_alignment = true;
+                    emit(events, repaint, Event::Status("Player control was not acknowledged; realigning to the room.".into()));
+                }
                 if player.seeking {
                     player.tracks = known_tracks.clone();
                     emit(events, repaint, Event::Player(player));
@@ -368,8 +403,9 @@ async fn run(
                         let is_host = state.leader == Some(login.session_id);
                         let desired = target(state, clock_offset, login.media.duration);
                         if needs_alignment {
-                            mpv.command(json!(["seek", desired, "absolute+exact"])).await?;
+                            mpv.arm_native_input();
                             mpv.set("pause", json!(state.paused)).await?;
+                            mpv.seek(desired).await?;
                             mpv.set("speed", json!(1.0)).await?;
                             needs_alignment = false;
                             // Do not publish the pre-seek sample as a host report.
@@ -388,7 +424,7 @@ async fn run(
                         } else {
                             if player.paused != state.paused { mpv.set("pause", json!(state.paused)).await?; }
                             match correction(position, desired, state.paused) {
-                                Correction::Seek(position) => { mpv.command(json!(["seek", position, "absolute+exact"])).await?; }
+                                Correction::Seek(position) => { mpv.seek(position).await?; }
                                 Correction::Speed(speed) => { mpv.set("speed", json!(speed)).await?; }
                                 _ => {}
                             }

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1
+
+- Fixed native mpv playback controls for guests: Space, seek keys, and on-screen-controller pause/seek changes now become shared room commands, rather than being corrected away. Host native input uses the same explicit control path.
+- Capture unsolicited mpv seek events; evaluate their landing positions after seeking finishes and track application-issued pauses/seeks to avoid synchronization feedback. Loading/quality switching is disarmed until alignment.
+- Keep native input intact while awaiting its server revision; withhold follower corrections and host measurements until acknowledgement, with a bounded fallback on missing acknowledgement.
+- Added two-real-mpv regression coverage using actual keypresses and raw absolute/relative/percentage seeks, plus checks for exactly-once controls, managed drift correction, and local volume/language choices.
+- Client-only fix: compatible with v0.3.0 servers; rebuild/update clients to enable native-player controls. Windows and Unix share the same event handling over their existing transports.
+
 ## 0.3.0
 
 - Every connected participant can now play, pause, and seek through the companion controls. Explicit shared commands increment a control revision; stale host measurements cannot overwrite them. Commands and host handoff broadcast promptly.

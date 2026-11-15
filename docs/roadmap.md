@@ -34,6 +34,7 @@
 - [ ] Remember non-secret connection preferences and recent servers.
 - [ ] Reconnect/backoff and secure credential persistence in the OS keyring, if desired.
 - [x] Quality preparation panel, encoder/fallback display, and keep-current-quality control.
+- [x] Native mpv keyboard/on-screen playback controls shared for hosts and guests, with sync-feedback suppression and direct-player regression tests.
 - [ ] More detailed loading/readiness indicators and accurate network/drift statistics.
 - [ ] Media library selection by host, playlists, and external subtitle uploads.
 - [ ] Packaging/installers and verified macOS support.

@@ -78,11 +78,19 @@ First connection becomes host. If that host disconnects, the server freezes the 
 1. Clients estimate server clock offset from the midpoint of their ping round trip, with exponential smoothing.
 2. Guest target position = snapshot position + elapsed server time when playing, clamped to source duration.
 3. A discrepancy up to 150 ms is tolerated. Between 150 ms and 1.5 seconds, mpv runs at 0.97× or 1.03×. Larger discrepancies seek; while paused, discrepancies over 150 ms seek immediately.
-4. Every client's companion controls send explicit commands to the server rather than changing mpv locally and hoping a later measurement propagates. The host still reports measured position and pause/buffering state every 500 ms.
+4. Companion controls and native mpv player input both send explicit commands to the server, for hosts and guests alike. Native input is captured before follower correction or host measurements; it is not inferred only from periodic host reports. The host still reports measured position and pause/buffering state every 500 ms.
 5. New loads, leader changes, and changes in `control_revision` trigger alignment, including on the host. No host measurement is sent from the pre-alignment sample, and measurements carry the revision that the player applied. This prevents stale reports overwriting shared controls. Host handoff also increments the control revision.
 6. Qualities share the complete source timeline. A quality switch loads the prepared file near the current server position, then realigns. Explicitly selected track IDs are reapplied when those tracks exist in the new rendition; per-type track order is retained.
 
 This is approximate real-time synchronization, not frame-accurate network playback. Clock asymmetry, mpv cache behavior, audio output latency, and long media seeks can affect convergence. The host itself is not continuously corrected against its own delayed reports. Playback speed is intended to remain 1× except for guest drift correction.
+
+### Native-player input and feedback suppression
+
+The IPC reader retains unsolicited mpv `seek` events instead of discarding every non-request message. The player sampler also detects changes to `pause` relative to the last application-issued/observed pause state. Space/seek keys and the built-in on-screen controller therefore use the same room `control` messages as companion buttons. A native pause freezes the actual player position when available; seeks use a fresh landing-position read bracketed by `seeking` checks, never the stale pre-seek sample.
+
+All synchronization seeks use a managed wrapper that records their target, issue time, and count. Matching seek events/landing positions are suppressed, with allowance for frame rounding and bounded natural advancement. Additional seek events or a different landing point are native input. Managed pause changes update the expected state and cannot echo as user toggles. Loading a file/quality resets and disarms detection until the player is aligned; stale no-event seek expectations expire. Volume/language choices are not shared controls.
+
+After native input is sent, the client temporarily withholds follower correction and host measurements, preserving the user's local action until a newer server control revision arrives. Missing acknowledgement after two seconds falls back to authoritative realignment. The existing revision protocol is unchanged, so v0.3.1 clients work with v0.3.0 servers. Headless regression tests exercise mpv's real default key bindings and raw seek commands, explicitly bypassing companion-window actions, and assert no room-revision feedback loops.
 
 ## Desktop IPC platforms
 
