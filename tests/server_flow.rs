@@ -225,6 +225,7 @@ async fn authenticated_streaming_transcoding_and_host_handoff() {
         ClientMessage::Playback {
             position: 2.0,
             paused: false,
+            control_revision: 0,
         },
     )
     .await;
@@ -236,13 +237,50 @@ async fn authenticated_streaming_transcoding_and_host_handoff() {
     }
     send(
         &mut host_ws,
-        ClientMessage::Playback {
-            position: 1.0,
-            paused: true,
+        ClientMessage::Control {
+            position: Some(1.0),
+            paused: Some(true),
         },
     )
     .await;
     until_room(&mut guest_ws, |s| s.position == 1.0 && s.paused).await;
+    // The guest controls both clients. Pause-only controls must not rewind to a stale sample.
+    send(
+        &mut guest_ws,
+        ClientMessage::Control {
+            position: Some(2.0),
+            paused: Some(false),
+        },
+    )
+    .await;
+    let shared = until_room(&mut host_ws, |s| s.position >= 2.0 && !s.paused).await;
+    send(
+        &mut guest_ws,
+        ClientMessage::Control {
+            position: None,
+            paused: Some(true),
+        },
+    )
+    .await;
+    let paused = until_room(&mut host_ws, |s| {
+        s.control_revision > shared.control_revision && s.paused
+    })
+    .await;
+    assert!(paused.position >= 2.0);
+    // An in-flight measurement from before the guest's controls is silently ignored.
+    send(
+        &mut host_ws,
+        ClientMessage::Playback {
+            position: 0.0,
+            paused: false,
+            control_revision: 0,
+        },
+    )
+    .await;
+    until_room(&mut guest_ws, |s| {
+        s.control_revision == paused.control_revision && s.paused && s.position >= 2.0
+    })
+    .await;
     send(
         &mut guest_ws,
         ClientMessage::Ping {
@@ -263,9 +301,9 @@ async fn authenticated_streaming_transcoding_and_host_handoff() {
     }
     send(
         &mut host_ws,
-        ClientMessage::Playback {
-            position: 1.0,
-            paused: false,
+        ClientMessage::Control {
+            position: Some(1.0),
+            paused: Some(false),
         },
     )
     .await;

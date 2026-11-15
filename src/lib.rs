@@ -4,7 +4,7 @@ pub mod room;
 pub mod server;
 pub mod sync;
 
-#[cfg(all(feature = "client", unix))]
+#[cfg(all(feature = "client", any(unix, windows)))]
 pub mod client;
 
 #[cfg(test)]

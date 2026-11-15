@@ -21,3 +21,37 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked
       - run: cargo test --locked --all-features
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install media tools
+        shell: pwsh
+        run: |
+          choco install ffmpeg mpv --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "Media-tool installation failed" }
+          # Prefer actual binaries to Chocolatey shims so process cancellation kills FFmpeg/mpv itself.
+          $ffmpeg = Get-ChildItem "$env:ChocolateyInstall\lib\ffmpeg*" -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          $mpv = Get-ChildItem "$env:ChocolateyInstall\lib\mpv*" -Recurse -Filter mpv.exe | Select-Object -First 1
+          if (!$ffmpeg -or !$mpv) { throw "Cannot locate installed FFmpeg/mpv executables" }
+          $ffmpeg.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $mpv.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "WATCHMPV_MPV_PATH=$($mpv.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features
+      - run: cargo build --locked --release --features client --bins
+      - uses: actions/upload-artifact@v4
+        with:
+          name: watchmpv-windows-x64
+          path: |
+            target/release/watchmpv-client.exe
+            target/release/watchmpv-server.exe
+            LICENSE
+            README.md
+            docs/windows.md

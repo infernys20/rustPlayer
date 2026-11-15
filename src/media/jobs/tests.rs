@@ -28,6 +28,68 @@ async fn partials(store: &MediaStore) -> Vec<PathBuf> {
 }
 
 #[tokio::test]
+async fn selected_storage_is_created_resolved_and_checked_without_leaving_probe_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let requested = temp.path().join("another drive").join("transcodes");
+    let directory = prepare_directory(requested.clone()).await.unwrap();
+    assert!(directory.is_absolute());
+    assert_eq!(directory, tokio::fs::canonicalize(requested).await.unwrap());
+    assert!(
+        tokio::fs::read_dir(directory)
+            .await
+            .unwrap()
+            .next_entry()
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn invalid_storage_reports_the_selected_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let blocked = temp.path().join("not-a-directory");
+    tokio::fs::write(&blocked, b"file").await.unwrap();
+    let error = prepare_directory(blocked.join("transcodes"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Create transcode directory"));
+    assert!(error.to_string().contains("not-a-directory"));
+}
+
+#[tokio::test]
+async fn transcodes_are_written_to_selected_storage_not_the_source_directory() {
+    let (_source_storage, source) = common::fixture(4).await;
+    let other_storage = tempfile::tempdir().unwrap();
+    let root = other_storage
+        .path()
+        .join("drive with spaces")
+        .join("transcodes");
+    let store = MediaStore::new(source.clone(), root.clone(), Encoder::Cpu)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .transcode_directory()
+            .starts_with(tokio::fs::canonicalize(root).await.unwrap())
+    );
+    assert_eq!(
+        store.path(Quality::Original),
+        tokio::fs::canonicalize(&source).await.unwrap()
+    );
+    store.prepare(Quality::P480).await;
+    assert!(matches!(
+        terminal(&store, Quality::P480).await,
+        RenditionStatus::Ready
+    ));
+    let output = store.path(Quality::P480);
+    assert_eq!(output.parent(), Some(store.transcode_directory()));
+    assert!(tokio::fs::metadata(output).await.unwrap().len() > 0);
+    assert!(partials(&store).await.is_empty());
+    assert!(tokio::fs::try_exists(source).await.unwrap());
+}
+
+#[tokio::test]
 async fn queued_cancellation_is_sticky_and_retry_is_bounded_and_shared() {
     let (temp, source) = common::fixture(4).await;
     let store = MediaStore::new(source, temp.path().join("cache"), Encoder::Cpu)

@@ -9,7 +9,7 @@ Local movie ── FFprobe ──> media/track metadata
      │
      └── FFmpeg (CPU or NVENC) ──> atomic MKV cache ─> lower-quality mpv clients
 
-mpv <── private JSON IPC ── desktop actor <── WebSocket ──> authoritative room
+mpv <── local JSON IPC ── desktop actor <── WebSocket ──> authoritative room
                                      ↑
                              native connection/menu UI
 ```
@@ -42,11 +42,15 @@ The JSON/body limit is 16 KiB, WebSocket messages/frames are limited to 4 KiB, a
 Client → server:
 
 ```json
-{ "type": "playback", "position": 42.5, "paused": false }
+{ "type": "control", "paused": false }
+{ "type": "control", "position": 42.5 }
+{ "type": "playback", "position": 42.5, "paused": false, "control_revision": 3 }
 { "type": "ping", "client_time_ms": 1790000000000.0 }
 ```
 
-Only the current host can send playback updates. Positions must be finite and within the source duration. The server projects the latest accepted position using a monotonic `Instant`, not wall time. Positions are clamped at the end of the source.
+Every connected participant can send explicit `control` commands. `position` and `paused` are optional, but at least one must be specified; omitted fields preserve the current state. A pause-only command samples the server's projected position, avoiding rewinds from a stale client sample. Commands are applied atomically under the room mutex, and the last accepted command wins. Each accepted command increments `control_revision`.
+
+Only the host sends periodic `playback` **measurements**. Their `control_revision` must match the current room control revision; stale or future-revision measurements are silently discarded, preventing in-flight reports from undoing another participant's command. Invalid positions and guest measurements are rejected. Positions must be finite and within the source duration (with the existing one-second end tolerance, clamped at the end). The server projects the latest accepted position using a monotonic `Instant`, not wall time.
 
 Server → client:
 
@@ -59,12 +63,13 @@ Server → client:
     "position": 43.0,
     "paused": false,
     "server_time_ms": 1790000000500.0,
-    "revision": 8
+    "revision": 8,
+    "control_revision": 3
   }
 }
 ```
 
-The server sends snapshots every 500 ms. It also sends `pong` with the echoed client timestamp and server wall-clock timestamp, or `error` with a human-readable message. A socket with no incoming messages for 20 seconds is removed; clients send pings every two seconds. Clients stop playback on sync loss (eight seconds without a room snapshot), socket close, or IPC failure. Native clients currently reconnect manually.
+The server sends snapshots every 500 ms, and promptly after controls, membership changes, or host handoff. A bounded broadcast notification wakes socket tasks; lagging tasks send the latest state, not an obsolete queued snapshot. It also sends `pong` with the echoed client timestamp and server wall-clock timestamp, or `error` with a human-readable message. A socket with no incoming messages for 20 seconds is removed; clients send pings every two seconds. Clients stop playback on sync loss (eight seconds without a room snapshot), socket close, or IPC failure. Native clients currently reconnect manually.
 
 First connection becomes host. If that host disconnects, the server freezes the projected timeline, pauses playback, and elects the oldest remaining participant. A session can have only one socket; use separate logins for separate instances. Host election is separate from login, so logging in without connecting does not claim the room.
 
@@ -73,11 +78,17 @@ First connection becomes host. If that host disconnects, the server freezes the 
 1. Clients estimate server clock offset from the midpoint of their ping round trip, with exponential smoothing.
 2. Guest target position = snapshot position + elapsed server time when playing, clamped to source duration.
 3. A discrepancy up to 150 ms is tolerated. Between 150 ms and 1.5 seconds, mpv runs at 0.97× or 1.03×. Larger discrepancies seek; while paused, discrepancies over 150 ms seek immediately.
-4. The host reports measured mpv position and pause/buffering state every 500 ms. Other clients never publish their own timeline.
-5. New loads and leader changes align once before a host is allowed to publish, avoiding a stale pre-load position overwriting the authoritative timeline.
+4. Every client's companion controls send explicit commands to the server rather than changing mpv locally and hoping a later measurement propagates. The host still reports measured position and pause/buffering state every 500 ms.
+5. New loads, leader changes, and changes in `control_revision` trigger alignment, including on the host. No host measurement is sent from the pre-alignment sample, and measurements carry the revision that the player applied. This prevents stale reports overwriting shared controls. Host handoff also increments the control revision.
 6. Qualities share the complete source timeline. A quality switch loads the prepared file near the current server position, then realigns. Explicitly selected track IDs are reapplied when those tracks exist in the new rendition; per-type track order is retained.
 
 This is approximate real-time synchronization, not frame-accurate network playback. Clock asymmetry, mpv cache behavior, audio output latency, and long media seeks can affect convergence. The host itself is not continuously corrected against its own delayed reports. Playback speed is intended to remain 1× except for guest drift correction.
+
+## Desktop IPC platforms
+
+The mpv process and JSON protocol share one implementation over split async read/write halves. Unix uses a socket inside an owner-only mode-0700 temporary directory, removed on drop. Windows uses a unique `\\.\pipe\watchmpv-<UUID>` named pipe, with Tokio's identification-level client security; missing/busy pipes are retried during startup. The launcher suppresses an extra Windows console and accepts `WATCHMPV_MPV_PATH`; Windows also checks for `mpv.exe` beside the client before PATH. Tokens are configured over IPC, not process arguments.
+
+Windows named-pipe ACLs are controlled by mpv/Windows, not by random naming alone. See [windows.md](windows.md) for setup and the local-account trust caveat. Platform-specific pipe tests and the shared two-mpv integration test are included in the Windows CI job; cross-compilation does not replace native execution.
 
 ## Media preparation
 
@@ -91,6 +102,12 @@ Original media is served untouched. A prepared rendition:
 - Preserves metadata, chapters, and language labels.
 
 Only one encode runs at once. Outputs are written to unique temporary files and atomically renamed only on success, so no viewer sees a partial MKV. FFmpeg runs without a shell, without stdin, with kill-on-drop and a 24-hour timeout. Remote clients get a generic failure message; FFmpeg diagnostics stay in operator logs, with a bounded 64 KiB stderr tail rather than unbounded accumulation.
+
+### Transcode storage
+
+`--transcode-dir` (legacy alias `--cache-dir`) or `WATCHMPV_TRANSCODE_DIR` selects the server's storage root. The CLI overrides the environment; the default remains `.watchmpv/cache`. The per-media cache key is unchanged. Startup creates and canonicalizes the per-media directory, writes/flushes/removes a small unique check file, and logs the absolute path; failures identify the selected path. This checks present writability, not capacity for an entire movie or whether an expected drive is mounted.
+
+All partial files and completed renditions are created under this directory, so atomic publication never moves data from the system temporary directory to another volume. Original media stays at its configured source path. Moving existing caches is an operator task while the server is stopped; changing the flag does not automatically migrate files. Storage paths are never accepted from remote viewers or exposed through metadata endpoints.
 
 ### Job lifecycle and progress
 

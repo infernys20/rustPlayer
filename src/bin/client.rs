@@ -1,4 +1,6 @@
-#[cfg(unix)]
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+#[cfg(any(unix, windows))]
 fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Watchmpv",
@@ -12,10 +14,8 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn main() {
-    eprintln!(
-        "The first Watchmpv client uses Unix-domain mpv IPC. Windows named-pipe support is planned."
-    );
+    eprintln!("Watchmpv requires Windows or a Unix desktop environment.");
     std::process::exit(1);
 }

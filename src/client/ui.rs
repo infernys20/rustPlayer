@@ -210,15 +210,15 @@ impl WatchApp {
             .is_some_and(|room| room.leader == self.session_id);
         ui.heading(&media.title);
         ui.label(if is_host {
-            "You are the host. Playback controls affect everyone."
+            "You are the host. Everyone can play, pause, and seek; only you can manage shared transcodes."
         } else {
-            "Following the host. Quality and language selections affect only you."
+            "Everyone can play, pause, and seek. Quality and language selections affect only you."
         });
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    is_host,
+                    self.room.is_some(),
                     egui::Button::new(if self.player.paused {
                         "▶ Play"
                     } else {
@@ -244,7 +244,7 @@ impl WatchApp {
             }
         });
         let slider = ui.add_enabled(
-            is_host,
+            self.room.is_some(),
             egui::Slider::new(&mut self.seek, 0.0..=media.duration)
                 .show_value(false)
                 .text("Seek"),

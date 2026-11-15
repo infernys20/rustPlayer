@@ -1,33 +1,32 @@
-use std::{os::unix::fs::DirBuilderExt, path::PathBuf, process::Stdio, time::Duration};
+use std::{ffi::OsString, process::Stdio, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
-    net::{
-        UnixStream,
-        unix::{OwnedReadHalf, OwnedWriteHalf},
-    },
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, ReadHalf, WriteHalf},
     process::{Child, Command},
 };
 
-use super::{PlayerState, PlayerTrack};
+use super::{
+    PlayerState, PlayerTrack,
+    ipc::{Endpoint, Stream},
+};
 
 pub struct Mpv {
     child: Child,
-    directory: PathBuf,
-    reader: Lines<BufReader<OwnedReadHalf>>,
-    writer: OwnedWriteHalf,
+    _endpoint: Endpoint,
+    reader: Lines<BufReader<ReadHalf<Stream>>>,
+    writer: WriteHalf<Stream>,
     request_id: u64,
     indexed_loadfile: bool,
 }
 
 impl Mpv {
     pub async fn launch(token: &str, headless: bool) -> Result<Self> {
-        let directory = std::env::temp_dir().join(format!("watchmpv-{}", uuid::Uuid::new_v4()));
-        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
-        let socket = directory.join("ipc.sock");
-        let mut command = Command::new("mpv");
+        let endpoint = Endpoint::new()?;
+        let mut command = Command::new(executable());
+        #[cfg(windows)]
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW: do not open an extra console.
         command
             .args([
                 "--no-config",
@@ -45,7 +44,7 @@ impl Mpv {
                 "--tls-verify=yes",
                 "--title=Watchmpv",
             ])
-            .arg(format!("--input-ipc-server={}", socket.display()));
+            .arg(endpoint.argument());
         if headless {
             command.args(["--vo=null", "--ao=null", "--force-window=no"]);
         }
@@ -62,14 +61,15 @@ impl Mpv {
         let mut child = match child {
             Ok(child) => child,
             Err(error) => {
-                let _ = std::fs::remove_dir_all(&directory);
-                return Err(error).context("Start mpv; install mpv 0.35+ and put it on PATH");
+                return Err(error).context("Start mpv; install mpv 0.35+ on PATH, set WATCHMPV_MPV_PATH, or place mpv.exe next to the Windows client");
             }
         };
         let connection = async {
-            for _ in 0..100 {
-                if let Ok(stream) = UnixStream::connect(&socket).await {
-                    return Ok(stream);
+            for _ in 0..200 {
+                match endpoint.connect().await {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) if Endpoint::retryable(&error) => {}
+                    Err(error) => return Err(error).context("Connect to mpv IPC"),
                 }
                 if let Some(status) = child.try_wait()? {
                     bail!("mpv exited on startup: {status}");
@@ -83,20 +83,19 @@ impl Mpv {
             Ok(stream) => stream,
             Err(error) => {
                 let _ = child.kill().await;
-                let _ = std::fs::remove_dir_all(&directory);
                 return Err(error);
             }
         };
-        let (reader, writer) = stream.into_split();
+        let (reader, writer) = tokio::io::split(stream);
         let mut mpv = Self {
             child,
-            directory,
+            _endpoint: endpoint,
             reader: BufReader::new(reader).lines(),
             writer,
             request_id: 0,
             indexed_loadfile: false,
         };
-        // Transfer credentials over the private IPC socket, never command-line arguments.
+        // Transfer credentials over IPC, never command-line arguments or media URLs.
         mpv.set(
             "http-header-fields",
             json!([format!("Authorization: Bearer {token}")]),
@@ -222,9 +221,23 @@ impl Mpv {
     }
 }
 
+fn executable() -> OsString {
+    if let Some(path) = std::env::var_os("WATCHMPV_MPV_PATH").filter(|path| !path.is_empty()) {
+        return path;
+    }
+    #[cfg(windows)]
+    if let Some(path) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("mpv.exe")))
+        && path.is_file()
+    {
+        return path.into_os_string();
+    }
+    OsString::from("mpv")
+}
+
 impl Drop for Mpv {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
-        let _ = std::fs::remove_dir_all(&self.directory);
     }
 }

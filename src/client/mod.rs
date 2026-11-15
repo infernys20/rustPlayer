@@ -1,3 +1,4 @@
+mod ipc;
 mod mpv;
 mod transcoding;
 mod ui;
@@ -240,9 +241,11 @@ async fn run(
                 let is_host = snapshot.as_ref().is_some_and(|s| s.leader == Some(login.session_id));
                 match action {
                     Action::Disconnect => break,
-                    Action::Pause(paused) if is_host && !pending_load => { mpv.set("pause", json!(paused)).await?; }
-                    Action::Seek(position) if is_host && !pending_load => {
-                        mpv.command(json!(["seek", position.clamp(0.0, login.media.duration), "absolute+exact"])).await?;
+                    Action::Pause(paused) if snapshot.is_some() => {
+                        socket.send(Message::Text(serde_json::to_string(&ClientMessage::Control { position: None, paused: Some(paused) })?.into())).await?;
+                    }
+                    Action::Seek(position) if snapshot.is_some() && position.is_finite() => {
+                        socket.send(Message::Text(serde_json::to_string(&ClientMessage::Control { position: Some(position.clamp(0.0, login.media.duration)), paused: None })?.into())).await?;
                     }
                     Action::Audio(id) => { mpv.set("aid", json!(id)).await?; preferred_audio = Some(id); }
                     Action::Subtitle(id) => { mpv.set("sid", id.map_or(json!("no"), |id| json!(id))).await?; preferred_subtitle = Some(id); }
@@ -301,7 +304,9 @@ async fn run(
                 match message? {
                     Message::Text(text) => match serde_json::from_str::<ServerMessage>(&text)? {
                         ServerMessage::Room { snapshot: next } => {
-                            if snapshot.as_ref().map(|s| s.leader) != Some(next.leader) { needs_alignment = true; }
+                            if snapshot.as_ref().is_none_or(|previous| previous.leader != next.leader || previous.control_revision != next.control_revision) {
+                                needs_alignment = true;
+                            }
                             last_snapshot = Instant::now();
                             emit(events, repaint, Event::Room(next.clone()));
                             snapshot = Some(next);
@@ -376,7 +381,7 @@ async fn run(
                             if last_report.elapsed() >= Duration::from_millis(500) {
                                 mpv.set("speed", json!(1.0)).await?;
                                 socket.send(Message::Text(serde_json::to_string(&ClientMessage::Playback {
-                                    position, paused: player.paused || player.buffering,
+                                    position, paused: player.paused || player.buffering, control_revision: state.control_revision,
                                 })?.into())).await?;
                                 last_report = Instant::now();
                             }

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0
+
+- Every connected participant can now play, pause, and seek through the companion controls. Explicit shared commands increment a control revision; stale host measurements cannot overwrite them. Commands and host handoff broadcast promptly.
+- Added Windows desktop support with mpv named-pipe IPC, a shared cross-platform JSON/player implementation, optional `WATCHMPV_MPV_PATH`, portable adjacent `mpv.exe` lookup, and no extra release-client console.
+- Added Windows named-pipe tests, native Windows CI builds/tests and executable artifacts, and `docs/windows.md` setup instructions. Native Windows runtime validation runs in CI, not on the Linux development machine.
+- Added guest-to-host mpv playback tests and stale-measurement regression tests. Shared transcode cancellation/retry remains host-only.
+- Rebuild both server and clients when upgrading: the v0.3 synchronization protocol is not compatible with v0.2.
+- Added the explicit `--transcode-dir` option and `WATCHMPV_TRANSCODE_DIR` environment setting for storing temporary/completed transcodes on another drive. `--cache-dir` remains a compatible alias and the default location is unchanged.
+- Resolve/log the storage directory and verify it is writable at startup, with actionable storage-path errors.
+- Added CLI compatibility and separate-storage output tests. Progressive playback during encoding is not part of this change.
+
 ## 0.2.0
 
 - Changed the project license from MIT to GNU GPL version 3 only (`GPL-3.0-only`).

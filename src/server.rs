@@ -19,7 +19,7 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::StreamExt;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, broadcast};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use uuid::Uuid;
@@ -44,6 +44,7 @@ pub struct AppState {
     password_hash: String,
     sessions: Mutex<HashMap<String, Session>>,
     room: Mutex<Room>,
+    room_changes: broadcast::Sender<()>,
     login_attempts: Mutex<Vec<Instant>>,
     password_slots: Arc<Semaphore>,
 }
@@ -65,6 +66,7 @@ impl AppState {
         .context("Password hashing task")??;
         Ok(Arc::new(Self {
             room: Mutex::new(Room::new(media.info.duration)),
+            room_changes: broadcast::channel(32).0,
             media,
             password_hash,
             sessions: Mutex::new(HashMap::new()),
@@ -326,6 +328,7 @@ async fn send(socket: &mut WebSocket, message: ServerMessage) -> bool {
 }
 
 async fn connection(state: Arc<AppState>, session: Session, mut socket: WebSocket) {
+    let mut changes = state.room_changes.subscribe();
     let joined = state.room.lock().await.join(Participant {
         id: session.id,
         name: session.name.clone(),
@@ -340,6 +343,7 @@ async fn connection(state: Arc<AppState>, session: Session, mut socket: WebSocke
         .await;
         return;
     }
+    let _ = state.room_changes.send(());
     tracing::info!(id = %session.id, "Viewer connected");
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -348,6 +352,11 @@ async fn connection(state: Arc<AppState>, session: Session, mut socket: WebSocke
     let mut message_count = 0;
     loop {
         tokio::select! {
+            _ = changes.recv() => {
+                // Controls and host handoff are broadcast promptly; lagged receivers get the latest state.
+                let snapshot = state.room.lock().await.snapshot();
+                if !send(&mut socket, ServerMessage::Room { snapshot }).await { break; }
+            }
             _ = tick.tick() => {
                 if session.expires <= Instant::now() || last_message.elapsed() > Duration::from_secs(20) { break; }
                 let snapshot = state.room.lock().await.snapshot();
@@ -367,8 +376,15 @@ async fn connection(state: Arc<AppState>, session: Session, mut socket: WebSocke
                             Ok(ClientMessage::Ping { client_time_ms }) if client_time_ms.is_finite() => {
                                 Some(ServerMessage::Pong { client_time_ms, server_time_ms: unix_ms() })
                             }
-                            Ok(ClientMessage::Playback { position, paused }) => {
-                                state.room.lock().await.update(session.id, position, paused).err()
+                            Ok(ClientMessage::Control { position, paused }) => {
+                                let result = state.room.lock().await.control(session.id, position, paused);
+                                match result {
+                                    Ok(()) => { let _ = state.room_changes.send(()); None }
+                                    Err(error) => Some(ServerMessage::Error { message: error.into() }),
+                                }
+                            }
+                            Ok(ClientMessage::Playback { position, paused, control_revision }) => {
+                                state.room.lock().await.report(session.id, position, paused, control_revision).err()
                                     .map(|error| ServerMessage::Error { message: error.into() })
                             }
                             _ => Some(ServerMessage::Error { message: "Invalid message".into() }),
@@ -382,6 +398,7 @@ async fn connection(state: Arc<AppState>, session: Session, mut socket: WebSocke
         }
     }
     state.room.lock().await.leave(session.id);
+    let _ = state.room_changes.send(());
     tracing::info!(id = %session.id, "Viewer disconnected");
 }
 

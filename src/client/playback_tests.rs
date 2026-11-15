@@ -130,8 +130,36 @@ async fn two_real_mpv_players_follow_play_pause_seek_quality_and_languages() {
     guest
         .wait(|p| !p.player.paused && p.player.position.is_some_and(|position| position > 1.0))
         .await;
-    host.actions.send(Action::Pause(true)).unwrap();
-    host.actions.send(Action::Seek(8.0)).unwrap();
+    guest.actions.send(Action::Pause(true)).unwrap();
+    guest.actions.send(Action::Seek(8.0)).unwrap();
+    host.wait(|p| {
+        p.player.paused
+            && p.player
+                .position
+                .is_some_and(|position| (position - 8.0).abs() < 0.2)
+    })
+    .await;
+    guest
+        .wait(|p| {
+            p.player.paused
+                && p.player
+                    .position
+                    .is_some_and(|position| (position - 8.0).abs() < 0.2)
+        })
+        .await;
+
+    guest.actions.send(Action::Pause(false)).unwrap();
+    host.wait(|p| !p.player.paused && p.player.position.is_some_and(|position| position > 8.5))
+        .await;
+    guest.actions.send(Action::Pause(true)).unwrap();
+    guest.actions.send(Action::Seek(8.0)).unwrap();
+    host.wait(|p| {
+        p.player.paused
+            && p.player
+                .position
+                .is_some_and(|position| (position - 8.0).abs() < 0.2)
+    })
+    .await;
     guest
         .wait(|p| {
             p.player.paused

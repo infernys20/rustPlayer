@@ -9,6 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use tokio::{
+    io::AsyncWriteExt,
     process::Command,
     sync::{Mutex, Semaphore, watch},
 };
@@ -61,8 +62,7 @@ impl MediaStore {
             metadata.modified()?,
             encoding.encoder
         ));
-        let cache = cache_root.join(format!("{:x}", hash.finalize()));
-        tokio::fs::create_dir_all(&cache).await?;
+        let cache = prepare_directory(cache_root.join(format!("{:x}", hash.finalize()))).await?;
         Ok(Arc::new(Self {
             source,
             info,
@@ -71,6 +71,11 @@ impl MediaStore {
             jobs: Mutex::new(HashMap::new()),
             slots: Semaphore::new(1),
         }))
+    }
+
+    /// Absolute, per-media directory containing both partial and completed transcodes.
+    pub fn transcode_directory(&self) -> &std::path::Path {
+        &self.cache
     }
 
     pub fn path(&self, quality: Quality) -> PathBuf {
@@ -367,6 +372,48 @@ impl MediaStore {
             ]);
         Ok(command)
     }
+}
+
+async fn prepare_directory(directory: PathBuf) -> Result<PathBuf> {
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .with_context(|| format!("Create transcode directory {}", directory.display()))?;
+    let directory = tokio::fs::canonicalize(&directory)
+        .await
+        .with_context(|| format!("Resolve transcode directory {}", directory.display()))?;
+    let probe = directory.join(format!(".write-check-{}", uuid::Uuid::new_v4()));
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .await
+        .with_context(|| {
+            format!(
+                "Transcode directory {} must be writable",
+                directory.display()
+            )
+        })?;
+    let written = async {
+        file.write_all(b"Watchmpv transcode storage check\n")
+            .await?;
+        file.flush().await
+    }
+    .await;
+    drop(file);
+    let cleanup = tokio::fs::remove_file(&probe).await;
+    written.with_context(|| {
+        format!(
+            "Write to transcode directory {} (check permissions and free space)",
+            directory.display()
+        )
+    })?;
+    cleanup.with_context(|| {
+        format!(
+            "Remove storage check from transcode directory {}",
+            directory.display()
+        )
+    })?;
+    Ok(directory)
 }
 
 // Do not let watch::Ref escape into select!'s output: it is not Send and can block writers.

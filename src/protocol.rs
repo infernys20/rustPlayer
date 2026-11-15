@@ -88,13 +88,27 @@ pub struct RoomSnapshot {
     pub paused: bool,
     pub server_time_ms: f64,
     pub revision: u64,
+    /// Increases only for explicit shared controls and host handoff, not position reports.
+    pub control_revision: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
-    Playback { position: f64, paused: bool },
-    Ping { client_time_ms: f64 },
+    /// Periodic measurements from the host, tagged with the controls already applied to mpv.
+    Playback {
+        position: f64,
+        paused: bool,
+        control_revision: u64,
+    },
+    /// Explicit, atomic control from any connected participant. Omitted fields are preserved.
+    Control {
+        position: Option<f64>,
+        paused: Option<bool>,
+    },
+    Ping {
+        client_time_ms: f64,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
