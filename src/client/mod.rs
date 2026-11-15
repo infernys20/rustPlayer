@@ -349,7 +349,7 @@ async fn run(
                     socket.send(Message::Text(serde_json::to_string(&ClientMessage::Ping { client_time_ms: unix_ms() })?.into())).await?;
                     last_ping = Instant::now();
                 }
-                if pending_load && load_started.elapsed() > Duration::from_secs(30) {
+                if pending_load && load_started.elapsed() > Duration::from_secs(200) {
                     bail!("mpv could not load the stream within 30 seconds. Check network access, server logs, and media format support.");
                 }
                 let mut player = mpv.sample().await?;
