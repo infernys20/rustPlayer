@@ -24,7 +24,11 @@ use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use uuid::Uuid;
 
-use crate::{media::MediaStore, protocol::*, room::Room};
+use crate::{
+    media::{JobControlError, MediaStore},
+    protocol::*,
+    room::Room,
+};
 
 const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 
@@ -74,6 +78,10 @@ pub fn router(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .route("/api/media", get(media_info))
         .route("/api/prepare", post(prepare))
+        .route("/api/encoding", get(encoding_info))
+        .route("/api/renditions", get(renditions))
+        .route("/api/renditions/{quality}/cancel", post(cancel_rendition))
+        .route("/api/renditions/{quality}/retry", post(retry_rendition))
         .route("/api/stream/{quality}", get(stream))
         .route("/api/ws", get(websocket))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
@@ -201,6 +209,63 @@ async fn prepare(
     Json(request): Json<PrepareRequest>,
 ) -> Json<RenditionStatus> {
     Json(state.media.prepare(request.quality).await)
+}
+
+async fn encoding_info(State(state): State<Arc<AppState>>) -> Json<EncodingInfo> {
+    Json(state.media.encoding.clone())
+}
+
+async fn renditions(State(state): State<Arc<AppState>>) -> Json<Vec<RenditionInfo>> {
+    Json(state.media.renditions().await)
+}
+
+async fn cancel_rendition(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(session): axum::Extension<Session>,
+    Path(quality): Path<String>,
+) -> Response {
+    // Hold the room guard across the operation to serialize controls with host handoff.
+    let room = state.room.lock().await;
+    if room.snapshot().leader != Some(session.id) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "Only the connected host can cancel shared transcodes",
+        );
+    }
+    let Some(quality) = Quality::ALL.into_iter().find(|q| q.key() == quality) else {
+        return api_error(StatusCode::NOT_FOUND, "Unknown quality");
+    };
+    Json(state.media.cancel(quality).await).into_response()
+}
+
+async fn retry_rendition(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(session): axum::Extension<Session>,
+    Path(quality): Path<String>,
+) -> Response {
+    let room = state.room.lock().await;
+    if room.snapshot().leader != Some(session.id) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "Only the connected host can retry shared transcodes",
+        );
+    }
+    let Some(quality) = Quality::ALL.into_iter().find(|q| q.key() == quality) else {
+        return api_error(StatusCode::NOT_FOUND, "Unknown quality");
+    };
+    match state.media.retry(quality).await {
+        Ok(status) => Json(status).into_response(),
+        Err(JobControlError::RetryTooSoon) => {
+            let mut response = api_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Wait at least five seconds between attempts for this quality",
+            );
+            response
+                .headers_mut()
+                .insert("retry-after", "5".parse().unwrap());
+            response
+        }
+    }
 }
 
 async fn stream(

@@ -4,8 +4,7 @@ use crate::{
     server::{AppState, router},
 };
 
-#[path = "../../tests/common/mod.rs"]
-mod common;
+use crate::test_media as common;
 
 struct Peer {
     actions: async_mpsc::UnboundedSender<Action>,
@@ -15,6 +14,7 @@ struct Peer {
     id: Option<uuid::Uuid>,
     player: PlayerState,
     quality: Quality,
+    renditions: Vec<RenditionInfo>,
 }
 
 impl Peer {
@@ -44,6 +44,7 @@ impl Peer {
             id: None,
             player: PlayerState::default(),
             quality: Quality::Original,
+            renditions: Vec::new(),
         }
     }
 
@@ -56,6 +57,7 @@ impl Peer {
                         Event::Room(room) => self.room = Some(room),
                         Event::Player(player) => self.player = player,
                         Event::Quality(quality) => self.quality = quality,
+                        Event::Renditions(renditions) => self.renditions = renditions,
                         Event::Status(status) => eprintln!("client: {status}"),
                         _ => {}
                     }
@@ -88,7 +90,7 @@ impl Drop for Peer {
 #[tokio::test]
 async fn two_real_mpv_players_follow_play_pause_seek_quality_and_languages() {
     let (temp, source) = common::fixture(20).await;
-    let media = MediaStore::new(source, temp.path().join("cache"), Encoder::Cpu)
+    let media = MediaStore::new(source.clone(), temp.path().join("cache"), Encoder::Cpu)
         .await
         .unwrap();
     let state = AppState::new(media, "test-password".into()).await.unwrap();
@@ -144,7 +146,26 @@ async fn two_real_mpv_players_follow_play_pause_seek_quality_and_languages() {
     guest
         .wait(|p| p.player.audio == Some(2) && p.player.subtitle == Some(2))
         .await;
+    // A failed preparation must not interrupt the original stream. When the host retries,
+    // everyone still waiting for that quality should switch without re-selecting it.
+    let moved = temp.path().join("temporarily-unavailable.mkv");
+    tokio::fs::rename(&source, &moved).await.unwrap();
     guest.actions.send(Action::Quality(Quality::P480)).unwrap();
+    guest
+        .wait(|p| {
+            p.renditions.iter().any(|r| {
+                r.quality == Quality::P480 && matches!(r.status, RenditionStatus::Failed { .. })
+            })
+        })
+        .await;
+    assert_eq!(guest.quality, Quality::Original);
+    assert!(guest.player.paused);
+    assert!((guest.player.position.unwrap() - 8.0).abs() < 0.2);
+    tokio::fs::rename(&moved, &source).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(5100)).await;
+    host.actions
+        .send(Action::RetryQuality(Quality::P480))
+        .unwrap();
     guest
         .wait(|p| {
             p.quality == Quality::P480

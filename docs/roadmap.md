@@ -18,8 +18,10 @@
 - [ ] Seek-aware generation of missing segments on the shared presentation timeline.
 - [ ] Separate reusable audio renditions and subtitle sidecars to avoid sending every language to everyone.
 - [ ] Bitrate-constrained quality profiles and automatic quality selection.
-- [ ] Preparation progress, cancellation/retry controls, disk quotas, and LRU eviction.
-- [ ] NVENC capability probing and configurable automatic CPU fallback.
+- [x] Preparation progress/speed/ETA and host-only shared cancellation/retry controls.
+- [x] Real NVENC startup probing and opt-in automatic CPU fallback (`--encoder auto`).
+- [ ] Disk quotas, LRU eviction, and per-job resource budgets.
+- [ ] Optional mid-job hardware-failure recovery on CPU (auto currently selects once at startup).
 - [ ] Optional hardware decode/scaling, with explicit GPU concurrency budgets.
 - [ ] More coverage for PGS/VobSub, ASS font attachments, HDR/tone mapping, rotation, and unusual timestamps.
 
@@ -29,7 +31,8 @@
 - [ ] Windows named-pipe IPC or cross-platform embedded-player integration.
 - [ ] Remember non-secret connection preferences and recent servers.
 - [ ] Reconnect/backoff and secure credential persistence in the OS keyring, if desired.
-- [ ] Loading/readiness indicators, accurate network/drift statistics, and quality preparation progress.
+- [x] Quality preparation panel, encoder/fallback display, and keep-current-quality control.
+- [ ] More detailed loading/readiness indicators and accurate network/drift statistics.
 - [ ] Media library selection by host, playlists, and external subtitle uploads.
 - [ ] Packaging/installers and verified macOS support.
 

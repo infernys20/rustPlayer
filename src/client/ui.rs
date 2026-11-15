@@ -4,7 +4,10 @@ use eframe::egui::{self, Color32, RichText};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::{Action, ConnectOptions, Event, PlayerState, start};
-use crate::protocol::{MediaInfo, Quality, RoomSnapshot};
+use crate::protocol::{
+    EncodingInfo, MediaInfo, PreparationPhase, Quality, RenditionInfo, RenditionStatus,
+    RoomSnapshot,
+};
 
 pub struct WatchApp {
     address: String,
@@ -20,6 +23,8 @@ pub struct WatchApp {
     player: PlayerState,
     quality: Quality,
     requested_quality: Quality,
+    renditions: Vec<RenditionInfo>,
+    encoding: Option<EncodingInfo>,
     seek: f64,
     dragging_seek: bool,
 }
@@ -40,6 +45,8 @@ impl Default for WatchApp {
             player: PlayerState::default(),
             quality: Quality::Original,
             requested_quality: Quality::Original,
+            renditions: Vec::new(),
+            encoding: None,
             seek: 0.0,
             dragging_seek: false,
         }
@@ -59,6 +66,8 @@ impl WatchApp {
         self.player = PlayerState::default();
         self.quality = Quality::Original;
         self.requested_quality = Quality::Original;
+        self.renditions.clear();
+        self.encoding = None;
         let (actions, events) = start(
             ConnectOptions {
                 address: self.address.clone(),
@@ -91,6 +100,8 @@ impl WatchApp {
                     self.player = player;
                 }
                 Event::Quality(quality) => self.quality = quality,
+                Event::Renditions(renditions) => self.renditions = renditions,
+                Event::Encoding(encoding) => self.encoding = Some(encoding),
                 Event::Status(status) => self.status = status,
                 Event::Failed(error) => self.error = Some(error),
                 Event::Disconnected => {
@@ -144,6 +155,49 @@ impl WatchApp {
             RichText::new("Use HTTPS or a trusted VPN outside your local network.")
                 .color(Color32::YELLOW),
         );
+    }
+
+    fn transcoding_panel(&self, ui: &mut egui::Ui, is_host: bool) {
+        egui::CollapsingHeader::new("Server transcoding").default_open(true).show(ui, |ui| {
+            if let Some(encoding) = &self.encoding {
+                ui.label(format!("Encoder: {}{}", encoding.encoder.label(), if encoding.automatic { " (automatic)" } else { "" }));
+                if let Some(reason) = &encoding.fallback_reason { ui.colored_label(Color32::YELLOW, reason); }
+            }
+            for rendition in self.renditions.iter().filter(|r| r.quality != Quality::Original) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(rendition.quality.label());
+                    match &rendition.status {
+                        RenditionStatus::Idle => { ui.label("Not prepared"); }
+                        RenditionStatus::Ready => { ui.colored_label(Color32::LIGHT_GREEN, "Ready"); }
+                        RenditionStatus::Cancelled => {
+                            ui.label("Cancelled");
+                            if is_host && ui.button("Retry").clicked() { self.send(Action::RetryQuality(rendition.quality)); }
+                        }
+                        RenditionStatus::Failed { .. } => {
+                            ui.colored_label(Color32::LIGHT_RED, "Failed");
+                            if is_host && ui.button("Retry").clicked() { self.send(Action::RetryQuality(rendition.quality)); }
+                        }
+                        RenditionStatus::Preparing { progress } => {
+                            match progress.phase {
+                                PreparationPhase::Queued => { ui.spinner(); ui.label("Queued — waiting for encoder"); }
+                                PreparationPhase::Cancelling => { ui.spinner(); ui.label("Cancelling…"); }
+                                PreparationPhase::Encoding => {
+                                    let bar = egui::ProgressBar::new(progress.fraction as f32).desired_width(160.0).show_percentage();
+                                    ui.add(if progress.fraction >= 1.0 { bar.text("Finalizing…") } else { bar });
+                                    if let Some(speed) = progress.speed { ui.label(format!("{speed:.1}×")); }
+                                    if let Some(eta) = progress.eta_seconds { ui.label(format!("~{} left", timestamp(eta))); }
+                                }
+                            }
+                            if is_host && progress.phase != PreparationPhase::Cancelling && ui.button("Cancel shared job").clicked() {
+                                self.send(Action::CancelQuality(rendition.quality));
+                            }
+                        }
+                    }
+                });
+                if let RenditionStatus::Failed { message } = &rendition.status { ui.small(message); }
+            }
+            ui.small("Cancel affects all viewers waiting for that quality, not completed streams. Only the host can cancel/retry; retries are limited to once per five seconds per quality.");
+        });
     }
 
     fn playback_menu(&mut self, ui: &mut egui::Ui) {
@@ -280,7 +334,12 @@ impl WatchApp {
                 ui.end_row();
             });
         ui.label(format!("Active quality: {}", self.quality.label()));
-        ui.small("A new transcoded quality is prepared in full before switching; this can take time. All included languages are preserved.");
+        if self.requested_quality != self.quality && ui.button("Keep current quality").clicked() {
+            self.requested_quality = self.quality;
+            self.send(Action::Quality(self.quality));
+        }
+        ui.small("The current stream keeps playing until your requested quality is ready. All included languages are preserved.");
+        self.transcoding_panel(ui, is_host);
         ui.separator();
         ui.heading("Watching together");
         if let Some(room) = &self.room {
@@ -332,18 +391,20 @@ impl eframe::App for WatchApp {
             }
         });
         egui::CentralPanel::default().show(context, |ui| {
-            ui.add_space(12.0);
-            if self.media.is_some() {
-                self.playback_menu(ui);
-            } else if self.actions.is_some() {
-                ui.spinner();
-                ui.label("Connecting to the watch party…");
-                if ui.button("Cancel").clicked() {
-                    self.send(Action::Disconnect);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add_space(12.0);
+                if self.media.is_some() {
+                    self.playback_menu(ui);
+                } else if self.actions.is_some() {
+                    ui.spinner();
+                    ui.label("Connecting to the watch party…");
+                    if ui.button("Cancel").clicked() {
+                        self.send(Action::Disconnect);
+                    }
+                } else {
+                    self.connection_menu(ui, context);
                 }
-            } else {
-                self.connection_menu(ui, context);
-            }
+            });
         });
         context.request_repaint_after(std::time::Duration::from_millis(250));
     }

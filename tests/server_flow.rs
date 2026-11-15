@@ -115,6 +115,8 @@ async fn authenticated_streaming_transcoding_and_host_handoff() {
     let http = Client::new();
     for path in [
         "api/media",
+        "api/encoding",
+        "api/renditions",
         "api/stream/original",
         "api/stream/p480",
         "api/ws",
@@ -276,8 +278,8 @@ async fn authenticated_streaming_transcoding_and_host_handoff() {
 
     // Concurrent viewers share a single job and a single complete, seekable file.
     let (first, second) = tokio::join!(media.prepare(Quality::P480), media.prepare(Quality::P480));
-    assert!(matches!(first, RenditionStatus::Preparing));
-    assert!(matches!(second, RenditionStatus::Preparing));
+    assert!(matches!(first, RenditionStatus::Preparing { .. }));
+    assert!(matches!(second, RenditionStatus::Preparing { .. }));
     timeout(Duration::from_secs(60), async {
         loop {
             let status: RenditionStatus = http
@@ -295,7 +297,18 @@ async fn authenticated_streaming_transcoding_and_host_handoff() {
             match status {
                 RenditionStatus::Ready => break,
                 RenditionStatus::Failed { message } => panic!("{message}"),
-                RenditionStatus::Preparing => tokio::time::sleep(Duration::from_millis(100)).await,
+                RenditionStatus::Preparing { progress } => {
+                    assert!(
+                        progress.fraction.is_finite() && (0.0..=1.0).contains(&progress.fraction)
+                    );
+                    assert!(
+                        progress
+                            .eta_seconds
+                            .is_none_or(|eta| eta.is_finite() && eta >= 0.0)
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                other => panic!("Unexpected status: {other:?}"),
             }
         }
     })

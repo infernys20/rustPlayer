@@ -1,26 +1,16 @@
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+mod jobs;
+mod transcode;
+
+pub use jobs::{JobControlError, MediaStore};
+pub use transcode::Encoder;
+
+use std::{collections::HashMap, path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use clap::ValueEnum;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use tokio::{
-    process::Command,
-    sync::{Mutex, Semaphore},
-};
+use tokio::process::Command;
 
-use crate::protocol::{MediaInfo, Quality, RenditionStatus, TrackInfo};
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum Encoder {
-    Cpu,
-    Nvenc,
-}
+use crate::protocol::{MediaInfo, TrackInfo};
 
 #[derive(Deserialize)]
 struct Probe {
@@ -115,170 +105,4 @@ pub async fn inspect(path: &Path) -> Result<MediaInfo> {
             })
             .collect(),
     })
-}
-
-pub struct MediaStore {
-    pub source: PathBuf,
-    pub info: MediaInfo,
-    cache: PathBuf,
-    encoder: Encoder,
-    jobs: Mutex<HashMap<Quality, RenditionStatus>>,
-    slots: Semaphore,
-}
-
-impl MediaStore {
-    pub async fn new(source: PathBuf, cache_root: PathBuf, encoder: Encoder) -> Result<Arc<Self>> {
-        let source = tokio::fs::canonicalize(source)
-            .await
-            .context("Open media source")?;
-        let metadata = tokio::fs::metadata(&source).await?;
-        if !metadata.is_file() {
-            bail!("Media source must be a regular file");
-        }
-        let info = inspect(&source).await?;
-        let mut hash = Sha256::new();
-        hash.update(format!(
-            "v1|{}|{}|{:?}|{:?}",
-            source.display(),
-            metadata.len(),
-            metadata.modified()?,
-            encoder
-        ));
-        let cache = cache_root.join(format!("{:x}", hash.finalize()));
-        tokio::fs::create_dir_all(&cache).await?;
-        Ok(Arc::new(Self {
-            source,
-            info,
-            cache,
-            encoder,
-            jobs: Mutex::new(HashMap::new()),
-            slots: Semaphore::new(1),
-        }))
-    }
-
-    pub fn path(&self, quality: Quality) -> PathBuf {
-        if quality == Quality::Original {
-            self.source.clone()
-        } else {
-            self.cache.join(format!("{}.mkv", quality.key()))
-        }
-    }
-
-    pub async fn prepare(self: &Arc<Self>, quality: Quality) -> RenditionStatus {
-        if quality == Quality::Original
-            || tokio::fs::try_exists(self.path(quality))
-                .await
-                .unwrap_or(false)
-        {
-            return RenditionStatus::Ready;
-        }
-        let mut jobs = self.jobs.lock().await;
-        if let Some(status) = jobs.get(&quality) {
-            return status.clone();
-        }
-        jobs.insert(quality, RenditionStatus::Preparing);
-        let store = self.clone();
-        tokio::spawn(async move {
-            let result = store.transcode(quality).await;
-            let status = match result {
-                Ok(()) => RenditionStatus::Ready,
-                Err(error) => {
-                    tracing::error!(?quality, %error, "Transcode failed");
-                    // No source paths or FFmpeg diagnostics are exposed to remote clients.
-                    RenditionStatus::Failed { message: "Transcoding failed. Ask the server operator to check logs and encoder availability.".into() }
-                }
-            };
-            store.jobs.lock().await.insert(quality, status);
-        });
-        RenditionStatus::Preparing
-    }
-
-    pub async fn ready(&self, quality: Quality) -> bool {
-        quality == Quality::Original
-            || tokio::fs::try_exists(self.path(quality))
-                .await
-                .unwrap_or(false)
-    }
-
-    async fn transcode(&self, quality: Quality) -> Result<()> {
-        let _slot = self.slots.acquire().await?;
-        let temporary = self.cache.join(format!(
-            "{}.{}.partial.mkv",
-            quality.key(),
-            uuid::Uuid::new_v4()
-        ));
-        let mut command = Command::new("ffmpeg");
-        command
-            .kill_on_drop(true)
-            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
-            .arg(&self.source)
-            // V excludes attached cover art. Keep every language and font attachment.
-            .args([
-                "-map",
-                "0:V:0",
-                "-map",
-                "0:a?",
-                "-map",
-                "0:s?",
-                "-map",
-                "0:t?",
-                "-map_metadata",
-                "0",
-                "-map_chapters",
-                "0",
-            ])
-            .args([
-                "-vf",
-                &format!(
-                    "scale=-2:trunc(min({}\\,ih)/2)*2",
-                    quality
-                        .height()
-                        .context("Original does not need transcoding")?
-                ),
-            ]);
-        match self.encoder {
-            Encoder::Cpu => {
-                command.args(["-c:v", "libx264", "-preset", "fast", "-crf", "22"]);
-            }
-            Encoder::Nvenc => {
-                command.args([
-                    "-c:v",
-                    "h264_nvenc",
-                    "-preset",
-                    "p4",
-                    "-rc",
-                    "vbr",
-                    "-cq",
-                    "23",
-                    "-b:v",
-                    "0",
-                ]);
-            }
-        }
-        command
-            .args([
-                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-c:s", "copy", "-c:t",
-                "copy",
-            ])
-            .arg(&temporary);
-        let result = tokio::time::timeout(Duration::from_secs(24 * 3600), command.output()).await;
-        let result = match result {
-            Ok(Ok(output)) if output.status.success() => {
-                tokio::fs::rename(&temporary, self.path(quality))
-                    .await
-                    .context("Publish prepared rendition")
-            }
-            Ok(Ok(output)) => Err(anyhow::anyhow!(
-                "FFmpeg {:?}: {}",
-                self.encoder,
-                String::from_utf8_lossy(&output.stderr)
-            )),
-            Ok(Err(error)) => Err(error).context("Start ffmpeg"),
-            Err(error) => Err(error).context("Transcoding exceeded 24 hour limit"),
-        };
-        if result.is_err() {
-            let _ = tokio::fs::remove_file(&temporary).await;
-        }
-        result
-    }
 }

@@ -2,7 +2,7 @@
 
 A Rust watch-together companion for **mpv**, with a password-protected media server. Guests do **not** need the video file: the server sends it over HTTP, and a WebSocket connection keeps playback synchronized.
 
-This is the first working vertical slice, not a production release. The client provides a native connection/control menu and opens video in a **separate mpv window**. Embedding libmpv into the application is a later milestone.
+This is an early development build (v0.2), not a production release. The client provides a native connection/control menu and opens video in a **separate mpv window**. Embedding libmpv into the application is a later milestone.
 
 ## Implemented
 
@@ -10,7 +10,8 @@ This is the first working vertical slice, not a production release. The client p
 - One local video / one watch room per server process; up to 32 connected viewers.
 - Authenticated, seekable HTTP streaming; no file copy required on clients.
 - Original, 1080p, 720p, and 480p quality choices, with no upscaling.
-- Shared, on-demand FFmpeg transcode jobs using CPU (`libx264`) or NVIDIA **NVENC** (`h264_nvenc`).
+- Shared, on-demand FFmpeg transcode jobs using CPU (`libx264`) or NVIDIA **NVENC** (`h264_nvenc`), with an opt-in automatic encoder mode.
+- A live transcoding panel showing queued/encoding/cancelling states, progress, speed, and estimated time remaining. The connected host can cancel or retry shared jobs; guests can keep waiting or stay on their current quality.
 - Independent audio/subtitle choices on each viewer. Prepared Matroska renditions retain all source audio/subtitle languages and font attachments. Audio is converted to AAC; subtitles are copied, not burned in. This supports formats such as ASS and PGS when the installed FFmpeg/mpv support them.
 - Host play/pause/seek, late joining, clock-offset estimation, and drift correction. Small errors use ±3% playback speed; larger errors seek.
 - Automatic host handoff to the oldest connected guest, with playback paused on handoff.
@@ -90,7 +91,13 @@ ffmpeg -hide_banner -f lavfi -i 'testsrc2=size=640x480:rate=30' \
   -t 1 -c:v h264_nvenc -f null -
 ```
 
-`--encoder cpu` is the portable fallback. NVENC failures are reported rather than silently using CPU resources. This version uses GPU **encoding**, not GPU decode/scaling. Server diagnostics are available with `RUST_LOG=watchmpv=debug`.
+Encoder modes:
+
+- `--encoder cpu` (default): use portable CPU encoding without probing NVIDIA hardware.
+- `--encoder nvenc`: perform a real one-frame NVENC encode at startup and fail early if it is unusable. This strict mode never silently uses CPU resources.
+- `--encoder auto`: run the same probe and prefer NVENC; if the probe fails or times out, select CPU and show the fallback in the server log and client transcoding panel.
+
+For automatic selection, replace `--encoder nvenc` in the command above with `--encoder auto`. The decision is made **once at startup**; this does not retry source-specific failures or GPU failures mid-encode on CPU. Restart with `--encoder cpu` if necessary. This version uses GPU **encoding**, not GPU decode/scaling. Server diagnostics are available with `RUST_LOG=watchmpv=debug`.
 
 Prepared files live under `.watchmpv/cache` by default (`--cache-dir` changes this). The cache key includes source path, size, modification time, encoder, and profile version. Do not modify a source file while hosting it. There is no automatic eviction yet; stop the server and remove old cache directories to reclaim disk space. Choose a cache with enough space and do not share a writable cache between untrusted users.
 
@@ -106,9 +113,14 @@ cargo run --features client --bin watchmpv-client
 2. Enter your name and the server password.
 3. The first connected viewer becomes host. Everyone initially joins paused.
 4. Use the companion window to play, pause, seek, change quality, and select an audio/subtitle language. Guests cannot change the shared timeline. Playback controls inside a guest's mpv window will be corrected back to the host state.
-5. The password field is cleared after connecting. If the connection drops, re-enter the password to reconnect; playback stops instead of continuing unsynchronized.
+5. Expand **Server transcoding** to see preparation progress for all qualities. The host can cancel queued/running jobs or retry failed/cancelled jobs. Cancellation affects everyone waiting for that quality, but never stops a completed stream. A retry is limited to once per five seconds per quality; viewers still waiting switch automatically once it succeeds. **Keep current quality** stops your own pending switch without cancelling the shared job.
+6. The password field is cleared after connecting. If the connection drops, re-enter the password to reconnect; playback stops instead of continuing unsynchronized.
 
 The server must be reachable by every client. For LAN use allow TCP port 8787 through the server firewall. For remote use, prefer HTTPS or a trusted VPN rather than exposing unencrypted HTTP.
+
+### Upgrading from v0.1
+
+Rebuild/restart **both server and clients**: v0.2 adds inventory/control endpoints and `idle`/`cancelled` job states. Existing password files, CLI media paths, and completed CPU/NVENC cache files remain compatible. Failed/cancelled jobs no longer require a server restart to retry.
 
 ## Internet deployment / TLS
 
@@ -133,7 +145,7 @@ cargo test --all-features          # also launches two headless mpv clients
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Tests require FFmpeg/FFprobe; all-feature tests also require mpv 0.35+. They generate disposable multi-audio/multi-subtitle video fixtures. No display or GPU is needed: mpv tests use null video/audio outputs. Tests cover authentication, byte ranges, metadata/language preservation, CPU transcoding, duplicate sessions, host-only commands, clock ping/pong, host handoff, and actual synchronized mpv playback/quality switching. Hardware NVENC execution must be validated separately on an NVIDIA machine.
+Tests require FFmpeg/FFprobe; all-feature tests also require mpv 0.35+. They generate disposable multi-audio/multi-subtitle video fixtures. No display or GPU is needed: mpv tests use null video/audio outputs. Tests cover authentication, byte ranges, metadata/language preservation, CPU transcoding, queued/running cancellation and partial-file cleanup, retry cooldowns and host permissions, progress parsing, automatic encoder probing/fallback, duplicate sessions, clock ping/pong, host handoff, and actual synchronized mpv playback/quality switching after a failed preparation and host retry. Hardware NVENC execution must be validated separately on an NVIDIA machine.
 
 ## Structure
 
@@ -141,13 +153,22 @@ Tests require FFmpeg/FFprobe; all-feature tests also require mpv 0.35+. They gen
 src/bin/server.rs       Server CLI and startup
 src/bin/client.rs       Desktop entry point
 src/server.rs           HTTP authentication, streams, and WebSocket transport
-src/media.rs            FFprobe inspection, cache, FFmpeg CPU/NVENC jobs
+src/media.rs            FFprobe inspection
+src/media/jobs.rs       Shared job lifecycle, cancellation, retry, and atomic cache
+src/media/transcode.rs  Encoder probing, FFmpeg arguments, progress, bounded diagnostics
 src/room.rs             Authoritative playback timeline and host election
 src/protocol.rs         Typed wire protocol shared by both applications
 src/sync.rs             Drift-correction policy
 src/client/ui.rs       Native egui menus and playback controls
 src/client/mod.rs      Network/player synchronization actor
+src/client/transcoding.rs  Asynchronous inventory/control HTTP requests
 src/client/mpv.rs      Private mpv process and JSON IPC
 ```
 
 See [docs/architecture.md](docs/architecture.md) for protocol and synchronization details, and [docs/roadmap.md](docs/roadmap.md) for the remaining milestones.
+
+## License
+
+Copyright (c) 2026 Watchmpv contributors.
+
+Watchmpv is free software licensed under the **GNU General Public License, version 3 only** (`GPL-3.0-only`). You may redistribute and modify it under those terms. It is provided without warranty; see [LICENSE](LICENSE) for the full license text. Third-party dependencies retain their respective licenses.

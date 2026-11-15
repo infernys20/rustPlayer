@@ -117,12 +117,69 @@ pub struct PrepareRequest {
     pub quality: Quality,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoEncoder {
+    Cpu,
+    Nvenc,
+}
+
+impl VideoEncoder {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU (libx264)",
+            Self::Nvenc => "NVIDIA NVENC",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EncodingInfo {
+    pub encoder: VideoEncoder,
+    pub automatic: bool,
+    pub fallback_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparationPhase {
+    #[default]
+    Queued,
+    Encoding,
+    Cancelling,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PreparationProgress {
+    pub phase: PreparationPhase,
+    /// Fraction of source duration encoded, in [0, 1]. Ready is reported only after publication.
+    pub fraction: f64,
+    pub encoded_seconds: f64,
+    pub speed: Option<f64>,
+    pub eta_seconds: Option<f64>,
+    pub encoder: Option<VideoEncoder>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RenditionStatus {
-    Preparing,
+    Idle,
+    Preparing {
+        // Allows the new client to decode old servers' bare preparing responses.
+        #[serde(default)]
+        progress: PreparationProgress,
+    },
     Ready,
-    Failed { message: String },
+    Cancelled,
+    Failed {
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RenditionInfo {
+    pub quality: Quality,
+    pub status: RenditionStatus,
 }
 
 pub fn unix_ms() -> f64 {
@@ -131,4 +188,37 @@ pub fn unix_ms() -> f64 {
         .unwrap_or_default()
         .as_secs_f64()
         * 1000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_preparing_responses_default_to_queued_progress() {
+        let status: RenditionStatus = serde_json::from_str(r#"{"state":"preparing"}"#).unwrap();
+        assert!(
+            matches!(status, RenditionStatus::Preparing { progress } if progress.phase == PreparationPhase::Queued && progress.fraction == 0.0)
+        );
+    }
+
+    #[test]
+    fn preparation_status_round_trips_without_losing_encoder_or_eta() {
+        let status = RenditionStatus::Preparing {
+            progress: PreparationProgress {
+                phase: PreparationPhase::Encoding,
+                fraction: 0.5,
+                encoded_seconds: 30.0,
+                speed: Some(2.0),
+                eta_seconds: Some(15.0),
+                encoder: Some(VideoEncoder::Nvenc),
+            },
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["state"], "preparing");
+        assert_eq!(json["progress"]["encoder"], "nvenc");
+        assert!(
+            matches!(serde_json::from_value::<RenditionStatus>(json).unwrap(), RenditionStatus::Preparing { progress } if progress.eta_seconds == Some(15.0))
+        );
+    }
 }

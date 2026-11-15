@@ -25,11 +25,15 @@ Only `/health` and `/api/login` are public. All other endpoints require `Authori
 | GET | `/health` | Minimal health check, no source metadata |
 | POST | `/api/login` | `{ "name": "Alice", "password": "…" }` → session ID, token, media metadata, expiry |
 | GET | `/api/media` | Source duration, resolution, audio/subtitle metadata |
-| POST | `/api/prepare` | `{ "quality": "p720" }` → `preparing`, `ready`, or `failed` |
+| POST | `/api/prepare` | `{ "quality": "p720" }` → start an idle rendition, otherwise return its existing status |
+| GET | `/api/encoding` | Selected encoder, automatic-mode flag, and sanitized fallback reason |
+| GET | `/api/renditions` | Read-only status/progress for all four quality choices |
+| POST | `/api/renditions/{quality}/cancel` | Connected-host-only cancellation of a shared job |
+| POST | `/api/renditions/{quality}/retry` | Connected-host-only retry of a failed/cancelled job |
 | GET/HEAD | `/api/stream/{quality}` | Seekable original or completed rendition; supports byte ranges |
 | GET | `/api/ws` | Authenticated WebSocket upgrade |
 
-Quality values: `original`, `p1080`, `p720`, `p480`. The API never accepts a source path, executable name, arbitrary filter, or FFmpeg argument from a client. Only the server operator chooses the source and encoder. Preparation is idempotent; polling the same quality shares the same job. A failed job remains failed until restart to prevent repeated resource-consuming retries. Preparing clients poll every two seconds. An unprepared stream returns HTTP 409.
+Quality values: `original`, `p1080`, `p720`, `p480`. The API never accepts a source path, executable name, arbitrary filter, or FFmpeg argument from a client. Only the server operator chooses the source and encoder. Preparation is idempotent; multiple requests share the same job, and ordinary preparation requests never restart failed/cancelled jobs. Only the connected host can retry or cancel; the room guard serializes these operations with host handoff. Retry attempts for a quality must be at least five seconds apart (HTTP 429 with `Retry-After: 5` otherwise). Repeated retry requests against an active or ready rendition are idempotent. Clients poll the read-only inventory once per second, with HTTP work running outside the playback loop. An unprepared stream returns HTTP 409.
 
 The JSON/body limit is 16 KiB, WebSocket messages/frames are limited to 4 KiB, and each socket is limited to 30 messages per second. There is a 32-participant room limit and a 128-session limit (including disconnected sessions until expiry). There is no CORS permission, and browser-Origin WebSocket upgrades are rejected; this API currently targets the native client only.
 
@@ -86,6 +90,25 @@ Original media is served untouched. A prepared rendition:
 - Copies all subtitle streams and font attachments into Matroska.
 - Preserves metadata, chapters, and language labels.
 
-Only one encode runs at once. Outputs are written to unique temporary files and atomically renamed only on success, so no viewer sees a partial MKV. FFmpeg runs without a shell, without stdin, with kill-on-drop and a 24-hour timeout. Remote clients get a generic failure message; FFmpeg diagnostics stay in operator logs. Restarting the server permits retrying a failed job. Failed temporary files are removed; abrupt process termination can leave orphaned partial files that may be deleted while the server is stopped.
+Only one encode runs at once. Outputs are written to unique temporary files and atomically renamed only on success, so no viewer sees a partial MKV. FFmpeg runs without a shell, without stdin, with kill-on-drop and a 24-hour timeout. Remote clients get a generic failure message; FFmpeg diagnostics stay in operator logs, with a bounded 64 KiB stderr tail rather than unbounded accumulation.
+
+### Job lifecycle and progress
+
+```text
+idle → preparing/queued → preparing/encoding → ready
+                    ↘ preparing/cancelling → cancelled
+                                         ↘ failed
+cancelled or failed → explicit host retry → preparing/queued
+```
+
+The API returns `idle`, `preparing`, `ready`, `cancelled`, or `failed`. A preparing response contains a `progress` object with `phase` (`queued`, `encoding`, or `cancelling`), `fraction` (0–1), `encoded_seconds`, optional `speed`/`eta_seconds`, and the actual `encoder` (`cpu` or `nvenc`). FFmpeg's machine-readable `-progress pipe:1` output is drained while the process runs. Negative timestamps, missing/invalid speeds, and non-finite values are handled without exposing invalid JSON. Progress is estimated from encoded timestamps, so reaching 100% is not the same as being ready: only successful process exit and atomic publication mark a rendition ready.
+
+Cancellation is a signal, not an abrupt task abort. A queued job exits without spawning FFmpeg. A running job kills and reaps FFmpeg, drains its pipes, removes its temporary file, and only then becomes cancelled and releases its encoder slot. Progress updates cannot overwrite a cancelling state. Cancellation and publication are serialized: a rendition that finishes publication first stays ready and remains playable. Failed/cancelled jobs are sticky so a guest's old preparation poll cannot unexpectedly restart them. Retrying creates a fresh attempt only after terminal cleanup. Abrupt server termination can still leave orphaned partial files, which may be deleted while the server is stopped.
+
+Clients continue playing the active rendition while waiting for another one. Changing back to the active quality only cancels the viewer's pending switch, not the shared server job. A host retry is observed through inventory polling; all viewers still waiting for that quality automatically switch once ready, preserving the source timeline and their selected languages.
+
+### Encoder selection
+
+CPU remains the default. Explicit NVENC and automatic mode perform an actual one-frame H.264 NVENC encode using the same encoder options as real jobs, with a ten-second timeout. Strict `nvenc` mode fails startup if this test fails. `auto` chooses CPU on probe failure and exposes only a generic fallback reason to viewers. Source-specific failures or later GPU failures do **not** trigger silent mid-job CPU fallback. The selected encoder is fixed for the server lifetime; cache keys use the actual encoder, so CPU selected by auto can reuse existing CPU output.
 
 This design intentionally avoids unfinished-HLS seeking problems in the first milestone. Future progressive segmented delivery needs a shared presentation timeline, keyframe-aligned renditions, seek-triggered generation and bounded caches; it cannot simply expose arbitrary encoder stdout as a fully seekable movie.

@@ -1,4 +1,5 @@
 mod mpv;
+mod transcoding;
 mod ui;
 
 use std::{
@@ -33,6 +34,8 @@ pub enum Action {
     Pause(bool),
     Seek(f64),
     Quality(Quality),
+    CancelQuality(Quality),
+    RetryQuality(Quality),
     Audio(i64),
     Subtitle(Option<i64>),
     Disconnect,
@@ -46,6 +49,8 @@ pub enum Event {
     Room(RoomSnapshot),
     Player(PlayerState),
     Quality(Quality),
+    Renditions(Vec<RenditionInfo>),
+    Encoding(EncodingInfo),
     Status(String),
     Failed(String),
     Disconnected,
@@ -164,6 +169,16 @@ async fn run(
     .await?
     .json()
     .await?;
+    let encoding: EncodingInfo = checked(
+        http.get(base.join("api/encoding")?)
+            .bearer_auth(&login.token)
+            .send()
+            .await?,
+    )
+    .await?
+    .json()
+    .await?;
+    emit(events, repaint, Event::Encoding(encoding));
     let mut ws_url = base.join("api/ws")?;
     ws_url
         .set_scheme(if base.scheme() == "https" {
@@ -211,7 +226,11 @@ async fn run(
     let mut loading_quality = Quality::Original;
     let mut preferred_audio = None;
     let mut preferred_subtitle = None;
-    let mut preparations = JoinSet::new();
+    // HTTP work is kept off the playback loop; a slow transcode/status request cannot stall sync.
+    let mut transcode_requests = JoinSet::new();
+    let mut inventory_pending = false;
+    let mut inventory_tick = tokio::time::interval(Duration::from_secs(1));
+    inventory_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -229,43 +248,52 @@ async fn run(
                     Action::Subtitle(id) => { mpv.set("sid", id.map_or(json!("no"), |id| json!(id))).await?; preferred_subtitle = Some(id); }
                     Action::Quality(quality) => {
                         wanted_quality = quality;
-                        preparations.abort_all();
-                        let http = http.clone();
-                        let url = base.join("api/prepare")?;
-                        let token = login.token.clone();
-                        preparations.spawn(async move {
-                            async {
-                                loop {
-                                    let status: RenditionStatus = checked(http.post(url.clone()).bearer_auth(&token).json(&PrepareRequest { quality })
-                                        .send().await?).await?.json().await?;
-                                    match status {
-                                        RenditionStatus::Ready => return Ok(quality),
-                                        RenditionStatus::Failed { message } => bail!("{message}"),
-                                        RenditionStatus::Preparing => tokio::time::sleep(Duration::from_secs(2)).await,
-                                    }
-                                }
-                            }.await
-                        });
-                        emit(events, repaint, Event::Status(format!("Preparing {} on the server; current quality keeps playing…", quality.label())));
+                        let request = transcoding::operate(http.clone(), base.clone(), login.token.clone(), quality, transcoding::Operation::Prepare);
+                        transcode_requests.spawn(async move { (false, request.await) });
+                        emit(events, repaint, Event::Status(format!("Requested {}; current stream keeps playing until it is ready.", quality.label())));
+                    }
+                    Action::CancelQuality(quality) if is_host => {
+                        let request = transcoding::operate(http.clone(), base.clone(), login.token.clone(), quality, transcoding::Operation::Cancel);
+                        transcode_requests.spawn(async move { (false, request.await) });
+                    }
+                    Action::RetryQuality(quality) if is_host => {
+                        let request = transcoding::operate(http.clone(), base.clone(), login.token.clone(), quality, transcoding::Operation::Retry);
+                        transcode_requests.spawn(async move { (false, request.await) });
                     }
                     _ => {}
                 }
             }
-            prepared = preparations.join_next(), if !preparations.is_empty() => {
-                match prepared {
-                    Some(Ok(Ok(quality))) if quality == wanted_quality => {
-                        current_url = base.join(&format!("api/stream/{}", quality.key()))?.to_string();
-                        let position = snapshot.as_ref().map(|s| target(s, clock_offset, login.media.duration)).unwrap_or(0.0);
-                        mpv.load(&current_url, position).await?;
-                        pending_load = true;
-                        load_started = Instant::now();
-                        needs_alignment = true;
-                        last_tracks = Instant::now() - Duration::from_secs(10);
-                        loading_quality = quality;
-                        emit(events, repaint, Event::Status(format!("Loading {}…", quality.label())));
+            _ = inventory_tick.tick(), if !inventory_pending => {
+                inventory_pending = true;
+                let http = http.clone();
+                let base = base.clone();
+                let token = login.token.clone();
+                transcode_requests.spawn(async move { (true, transcoding::inventory(&http, &base, &token).await) });
+            }
+            reply = transcode_requests.join_next(), if !transcode_requests.is_empty() => {
+                match reply {
+                    Some(Ok((poll, result))) => {
+                        if poll { inventory_pending = false; }
+                        match result {
+                            Ok(renditions) => {
+                                let ready = renditions.iter().any(|r| r.quality == wanted_quality && matches!(r.status, RenditionStatus::Ready));
+                                emit(events, repaint, Event::Renditions(renditions));
+                                if ready && wanted_quality != loading_quality {
+                                    current_url = base.join(&format!("api/stream/{}", wanted_quality.key()))?.to_string();
+                                    let position = snapshot.as_ref().map(|s| target(s, clock_offset, login.media.duration)).unwrap_or(0.0);
+                                    mpv.load(&current_url, position).await?;
+                                    pending_load = true;
+                                    load_started = Instant::now();
+                                    needs_alignment = true;
+                                    last_tracks = Instant::now() - Duration::from_secs(10);
+                                    loading_quality = wanted_quality;
+                                    emit(events, repaint, Event::Status(format!("Loading {}…", wanted_quality.label())));
+                                }
+                            }
+                            Err(error) => emit(events, repaint, Event::Status(format!("Transcode request failed: {error:#}. Playback is unchanged."))),
+                        }
                     }
-                    Some(Ok(Err(error))) => emit(events, repaint, Event::Status(format!("Quality change failed: {error:#}. Current stream is unchanged."))),
-                    _ => {}
+                    _ => { inventory_pending = false; }
                 }
             }
             message = socket.next() => {
@@ -367,7 +395,7 @@ async fn run(
             }
         }
     }
-    preparations.abort_all();
+    transcode_requests.abort_all();
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close(None)).await;
     Ok(())
 }

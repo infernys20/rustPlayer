@@ -21,6 +21,7 @@ struct Args {
     /// Read the password from a file instead of WATCHMPV_PASSWORD.
     #[arg(long)]
     password_file: Option<PathBuf>,
+    /// cpu: portable; nvenc: require a working GPU; auto: probe NVENC with CPU fallback.
     #[arg(long, value_enum, default_value = "cpu")]
     encoder: Encoder,
     #[arg(long, default_value = ".watchmpv/cache")]
@@ -47,7 +48,7 @@ async fn main() -> Result<()> {
             .context("Set WATCHMPV_PASSWORD or use --password-file (at least 8 bytes)")?
     };
     let media = MediaStore::new(args.media, args.cache_dir, args.encoder).await?;
-    tracing::info!(title = %media.info.title, duration = media.info.duration, encoder = ?args.encoder, "Media ready");
+    tracing::info!(title = %media.info.title, duration = media.info.duration, requested_encoder = ?args.encoder, selected_encoder = ?media.encoding.encoder, "Media ready");
     let state = AppState::new(media, password).await?;
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!(address = %listener.local_addr()?, "Watchmpv server listening; use HTTPS/WSS via a reverse proxy outside trusted networks");

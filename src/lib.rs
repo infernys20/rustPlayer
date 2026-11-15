@@ -6,3 +6,7 @@ pub mod sync;
 
 #[cfg(all(feature = "client", unix))]
 pub mod client;
+
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+pub(crate) mod test_media;
