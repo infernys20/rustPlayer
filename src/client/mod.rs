@@ -350,7 +350,7 @@ async fn run(
                     last_ping = Instant::now();
                 }
                 if pending_load && load_started.elapsed() > Duration::from_secs(200) {
-                    bail!("mpv could not load the stream within 30 seconds. Check network access, server logs, and media format support.");
+                    bail!("mpv could not load the stream within 200 seconds. Check network access, server logs, and media format support.");
                 }
                 let mut player = mpv.sample().await?;
                 if last_tracks.elapsed() >= Duration::from_secs(2) {
