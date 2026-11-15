@@ -1,0 +1,4 @@
+/target/
+/.watchmpv/
+*.password
+.env

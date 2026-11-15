@@ -1,0 +1,420 @@
+mod mpv;
+mod ui;
+
+use std::{
+    sync::mpsc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, bail};
+use futures_util::{SinkExt, StreamExt};
+use reqwest::{Client, Url};
+use serde_json::json;
+use tokio::{sync::mpsc as async_mpsc, task::JoinSet};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Message, client::IntoClientRequest},
+};
+
+use crate::{
+    protocol::*,
+    sync::{Correction, correction},
+};
+
+pub use ui::WatchApp;
+
+pub struct ConnectOptions {
+    pub address: String,
+    pub name: String,
+    pub password: String,
+}
+
+pub enum Action {
+    Pause(bool),
+    Seek(f64),
+    Quality(Quality),
+    Audio(i64),
+    Subtitle(Option<i64>),
+    Disconnect,
+}
+
+pub enum Event {
+    Connected {
+        media: MediaInfo,
+        session_id: uuid::Uuid,
+    },
+    Room(RoomSnapshot),
+    Player(PlayerState),
+    Quality(Quality),
+    Status(String),
+    Failed(String),
+    Disconnected,
+}
+
+#[derive(Clone, Default)]
+pub struct PlayerState {
+    pub position: Option<f64>,
+    pub paused: bool,
+    pub buffering: bool,
+    pub seeking: bool,
+    pub audio: Option<i64>,
+    pub subtitle: Option<i64>,
+    pub tracks: Vec<PlayerTrack>,
+}
+
+#[derive(Clone)]
+pub struct PlayerTrack {
+    pub id: i64,
+    pub kind: String,
+    pub label: String,
+}
+
+pub fn start(
+    options: ConnectOptions,
+    repaint: eframe::egui::Context,
+) -> (async_mpsc::UnboundedSender<Action>, mpsc::Receiver<Event>) {
+    let (actions, receiver) = async_mpsc::unbounded_channel();
+    let (events, output) = mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new();
+        match runtime {
+            Ok(runtime) => {
+                if let Err(error) =
+                    runtime.block_on(run(options, receiver, &events, &repaint, false))
+                {
+                    let _ = events.send(Event::Failed(format!("{error:#}")));
+                }
+            }
+            Err(error) => {
+                let _ = events.send(Event::Failed(error.to_string()));
+            }
+        }
+        let _ = events.send(Event::Disconnected);
+        repaint.request_repaint();
+    });
+    (actions, output)
+}
+
+fn server_url(address: &str) -> Result<Url> {
+    let address = address.trim();
+    let implicit_scheme = !address.contains("://");
+    let address = if !implicit_scheme {
+        address.to_owned()
+    } else {
+        format!("http://{address}")
+    };
+    let mut url =
+        Url::parse(&address).context("Enter an IP/hostname and port, or an http(s) URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        bail!("Use http(s)://host:port without credentials, path, query, or fragment");
+    }
+    if implicit_scheme && url.port().is_none() {
+        url.set_port(Some(8787))
+            .map_err(|_| anyhow::anyhow!("Invalid port"))?;
+    }
+    Ok(url)
+}
+
+async fn checked(response: reqwest::Response) -> Result<reqwest::Response> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let status = response.status();
+    let message: serde_json::Value = response.json().await.unwrap_or_default();
+    bail!(
+        "Server {status}: {}",
+        message["error"].as_str().unwrap_or("Request failed")
+    );
+}
+
+fn emit(events: &mpsc::Sender<Event>, repaint: &eframe::egui::Context, event: Event) {
+    let _ = events.send(event);
+    repaint.request_repaint();
+}
+
+async fn run(
+    options: ConnectOptions,
+    mut actions: async_mpsc::UnboundedReceiver<Action>,
+    events: &mpsc::Sender<Event>,
+    repaint: &eframe::egui::Context,
+    headless: bool,
+) -> Result<()> {
+    let base = server_url(&options.address)?;
+    let http = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let login: LoginResponse = checked(
+        http.post(base.join("api/login")?)
+            .json(&LoginRequest {
+                name: options.name,
+                password: options.password,
+            })
+            .send()
+            .await
+            .context("Connect to server")?,
+    )
+    .await?
+    .json()
+    .await?;
+    let mut ws_url = base.join("api/ws")?;
+    ws_url
+        .set_scheme(if base.scheme() == "https" {
+            "wss"
+        } else {
+            "ws"
+        })
+        .map_err(|_| anyhow::anyhow!("Invalid websocket URL"))?;
+    let mut request = ws_url.as_str().into_client_request()?;
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {}", login.token).parse()?);
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(15), connect_async(request))
+        .await
+        .context("WebSocket connection timed out")??;
+    emit(events, repaint, Event::Status("Starting mpv…".into()));
+    let mut mpv = mpv::Mpv::launch(&login.token, headless).await?;
+    let mut current_url = base.join("api/stream/original")?.to_string();
+    mpv.load(&current_url, 0.0).await?;
+    emit(
+        events,
+        repaint,
+        Event::Connected {
+            media: login.media.clone(),
+            session_id: login.session_id,
+        },
+    );
+    emit(
+        events,
+        repaint,
+        Event::Status("Connected. The video opens in a separate mpv window.".into()),
+    );
+
+    let mut snapshot: Option<RoomSnapshot> = None;
+    let mut last_snapshot = Instant::now();
+    let mut clock_offset: Option<f64> = None;
+    let mut last_ping = Instant::now() - Duration::from_secs(10);
+    let mut last_report = Instant::now() - Duration::from_secs(1);
+    let mut last_tracks = Instant::now() - Duration::from_secs(10);
+    let mut known_tracks = Vec::new();
+    let mut needs_alignment = true;
+    let mut pending_load = true;
+    let mut load_started = Instant::now();
+    let mut wanted_quality = Quality::Original;
+    let mut loading_quality = Quality::Original;
+    let mut preferred_audio = None;
+    let mut preferred_subtitle = None;
+    let mut preparations = JoinSet::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            action = actions.recv() => {
+                let Some(action) = action else { break; };
+                let is_host = snapshot.as_ref().is_some_and(|s| s.leader == Some(login.session_id));
+                match action {
+                    Action::Disconnect => break,
+                    Action::Pause(paused) if is_host && !pending_load => { mpv.set("pause", json!(paused)).await?; }
+                    Action::Seek(position) if is_host && !pending_load => {
+                        mpv.command(json!(["seek", position.clamp(0.0, login.media.duration), "absolute+exact"])).await?;
+                    }
+                    Action::Audio(id) => { mpv.set("aid", json!(id)).await?; preferred_audio = Some(id); }
+                    Action::Subtitle(id) => { mpv.set("sid", id.map_or(json!("no"), |id| json!(id))).await?; preferred_subtitle = Some(id); }
+                    Action::Quality(quality) => {
+                        wanted_quality = quality;
+                        preparations.abort_all();
+                        let http = http.clone();
+                        let url = base.join("api/prepare")?;
+                        let token = login.token.clone();
+                        preparations.spawn(async move {
+                            async {
+                                loop {
+                                    let status: RenditionStatus = checked(http.post(url.clone()).bearer_auth(&token).json(&PrepareRequest { quality })
+                                        .send().await?).await?.json().await?;
+                                    match status {
+                                        RenditionStatus::Ready => return Ok(quality),
+                                        RenditionStatus::Failed { message } => bail!("{message}"),
+                                        RenditionStatus::Preparing => tokio::time::sleep(Duration::from_secs(2)).await,
+                                    }
+                                }
+                            }.await
+                        });
+                        emit(events, repaint, Event::Status(format!("Preparing {} on the server; current quality keeps playing…", quality.label())));
+                    }
+                    _ => {}
+                }
+            }
+            prepared = preparations.join_next(), if !preparations.is_empty() => {
+                match prepared {
+                    Some(Ok(Ok(quality))) if quality == wanted_quality => {
+                        current_url = base.join(&format!("api/stream/{}", quality.key()))?.to_string();
+                        let position = snapshot.as_ref().map(|s| target(s, clock_offset, login.media.duration)).unwrap_or(0.0);
+                        mpv.load(&current_url, position).await?;
+                        pending_load = true;
+                        load_started = Instant::now();
+                        needs_alignment = true;
+                        last_tracks = Instant::now() - Duration::from_secs(10);
+                        loading_quality = quality;
+                        emit(events, repaint, Event::Status(format!("Loading {}…", quality.label())));
+                    }
+                    Some(Ok(Err(error))) => emit(events, repaint, Event::Status(format!("Quality change failed: {error:#}. Current stream is unchanged."))),
+                    _ => {}
+                }
+            }
+            message = socket.next() => {
+                let Some(message) = message else { bail!("Server closed the connection"); };
+                match message? {
+                    Message::Text(text) => match serde_json::from_str::<ServerMessage>(&text)? {
+                        ServerMessage::Room { snapshot: next } => {
+                            if snapshot.as_ref().map(|s| s.leader) != Some(next.leader) { needs_alignment = true; }
+                            last_snapshot = Instant::now();
+                            emit(events, repaint, Event::Room(next.clone()));
+                            snapshot = Some(next);
+                        }
+                        ServerMessage::Pong { client_time_ms, server_time_ms } => {
+                            let now = unix_ms();
+                            let rtt = now - client_time_ms;
+                            if (0.0..5000.0).contains(&rtt) {
+                                let measured = server_time_ms - (client_time_ms + now) / 2.0;
+                                clock_offset = Some(clock_offset.map_or(measured, |old| old * 0.8 + measured * 0.2));
+                            }
+                        }
+                        ServerMessage::Error { message } => emit(events, repaint, Event::Status(message)),
+                    },
+                    Message::Close(_) => bail!("Server closed the connection (session expired or connection lost)"),
+                    Message::Ping(bytes) => { socket.send(Message::Pong(bytes)).await?; }
+                    _ => {}
+                }
+            }
+            _ = tick.tick() => {
+                if last_snapshot.elapsed() > Duration::from_secs(8) {
+                    let _ = mpv.set("pause", json!(true)).await;
+                    bail!("Synchronization connection timed out. Playback stopped; reconnect to rejoin.");
+                }
+                if last_ping.elapsed() >= Duration::from_secs(2) {
+                    socket.send(Message::Text(serde_json::to_string(&ClientMessage::Ping { client_time_ms: unix_ms() })?.into())).await?;
+                    last_ping = Instant::now();
+                }
+                if pending_load && load_started.elapsed() > Duration::from_secs(30) {
+                    bail!("mpv could not load the stream within 30 seconds. Check network access, server logs, and media format support.");
+                }
+                let mut player = mpv.sample().await?;
+                if last_tracks.elapsed() >= Duration::from_secs(2) {
+                    known_tracks = mpv.tracks().await?;
+                    last_tracks = Instant::now();
+                }
+                if player.seeking {
+                    player.tracks = known_tracks.clone();
+                    emit(events, repaint, Event::Player(player));
+                    continue;
+                }
+                if let (Some(state), Some(position)) = (&snapshot, player.position) {
+                    let path = mpv.get("path").await?.and_then(|v| v.as_str().map(str::to_owned));
+                    if pending_load && path.as_deref() == Some(current_url.as_str()) {
+                        pending_load = false;
+                        emit(events, repaint, Event::Quality(loading_quality));
+                        emit(events, repaint, Event::Status(format!("Playing {}", loading_quality.label())));
+                        known_tracks = mpv.tracks().await?;
+                        if let Some(id) = preferred_audio
+                            && known_tracks.iter().any(|t| t.kind == "audio" && t.id == id) {
+                            mpv.set("aid", json!(id)).await?;
+                        }
+                        if let Some(id) = preferred_subtitle
+                            && id.is_none_or(|id| known_tracks.iter().any(|t| t.kind == "sub" && t.id == id)) {
+                            mpv.set("sid", id.map_or(json!("no"), |id| json!(id))).await?;
+                        }
+                    }
+                    if !pending_load {
+                        let is_host = state.leader == Some(login.session_id);
+                        let desired = target(state, clock_offset, login.media.duration);
+                        if needs_alignment {
+                            mpv.command(json!(["seek", desired, "absolute+exact"])).await?;
+                            mpv.set("pause", json!(state.paused)).await?;
+                            mpv.set("speed", json!(1.0)).await?;
+                            needs_alignment = false;
+                            // Do not publish the pre-seek sample as a host report.
+                            player.tracks = known_tracks.clone();
+                            emit(events, repaint, Event::Player(player));
+                            continue;
+                        }
+                        if is_host {
+                            if last_report.elapsed() >= Duration::from_millis(500) {
+                                mpv.set("speed", json!(1.0)).await?;
+                                socket.send(Message::Text(serde_json::to_string(&ClientMessage::Playback {
+                                    position, paused: player.paused || player.buffering,
+                                })?.into())).await?;
+                                last_report = Instant::now();
+                            }
+                        } else {
+                            if player.paused != state.paused { mpv.set("pause", json!(state.paused)).await?; }
+                            match correction(position, desired, state.paused) {
+                                Correction::Seek(position) => { mpv.command(json!(["seek", position, "absolute+exact"])).await?; }
+                                Correction::Speed(speed) => { mpv.set("speed", json!(speed)).await?; }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                player.tracks = known_tracks.clone();
+                emit(events, repaint, Event::Player(player));
+            }
+        }
+    }
+    preparations.abort_all();
+    let _ = tokio::time::timeout(Duration::from_secs(1), socket.close(None)).await;
+    Ok(())
+}
+
+fn target(snapshot: &RoomSnapshot, clock_offset: Option<f64>, duration: f64) -> f64 {
+    let elapsed = if snapshot.paused {
+        0.0
+    } else {
+        clock_offset.map_or(0.0, |offset| {
+            ((unix_ms() + offset - snapshot.server_time_ms) / 1000.0).max(0.0)
+        })
+    };
+    (snapshot.position + elapsed).clamp(0.0, duration)
+}
+
+#[cfg(test)]
+mod playback_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_addresses_are_strict_and_support_tls() {
+        assert_eq!(
+            server_url("127.0.0.1").unwrap().as_str(),
+            "http://127.0.0.1:8787/"
+        );
+        assert_eq!(
+            server_url("http://example.org:80").unwrap().as_str(),
+            "http://example.org/"
+        );
+        assert_eq!(
+            server_url("https://example.org").unwrap().as_str(),
+            "https://example.org/"
+        );
+        assert_eq!(
+            server_url("[::1]:9000").unwrap().as_str(),
+            "http://[::1]:9000/"
+        );
+        for bad in [
+            "file:///etc/passwd",
+            "https://user:pass@host",
+            "http://host/path",
+            "http://host?token=secret",
+        ] {
+            assert!(server_url(bad).is_err(), "{bad}");
+        }
+    }
+}
